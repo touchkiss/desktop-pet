@@ -1,0 +1,5 @@
+.build/
+DesktopPet.app/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
