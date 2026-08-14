@@ -12,10 +12,17 @@ final class PlaylistEngine {
     /// When true, stay on the last frame until `resumeAfterHold(playNext:)` is called.
     private var holdingAtEnd = false
     private var pendingNextID: String?
+    private var endingSoonFired = false
 
     /// Called when a clip reaches its last frame. Return `true` to advance immediately,
     /// or `false` to hold on the last frame (caller must later call `resumeAfterHold`).
     var clipFinishedHandler: ((String?) -> Bool)?
+
+    /// Called ONCE per clip pass when remaining play time drops below
+    /// `endingSoonLeadTime` (argument = seconds actually remaining). Lets a
+    /// teleport start its vanish effect while the clip is still moving.
+    var clipEndingSoonHandler: ((TimeInterval) -> Void)?
+    var endingSoonLeadTime: TimeInterval = 0.75
 
     func attach(store: LibraryStore) {
         self.store = store
@@ -30,6 +37,7 @@ final class PlaylistEngine {
         timer?.invalidate()
         holdingAtEnd = false
         pendingNextID = nil
+        endingSoonFired = false
         guard let store,
               let id = currentClipID,
               let clip = store.clip(id: id),
@@ -78,12 +86,14 @@ final class PlaylistEngine {
         pendingNextID = nil
         guard playNext else {
             currentFrameIndex = 1
+            endingSoonFired = false
             return
         }
         if let next {
             playClip(id: next)
         } else {
             currentFrameIndex = 1
+            endingSoonFired = false
         }
     }
 
@@ -99,6 +109,7 @@ final class PlaylistEngine {
 
         if currentFrameIndex < clip.frameCount {
             currentFrameIndex += 1
+            notifyEndingSoonIfNeeded(clip: clip)
             return
         }
 
@@ -109,11 +120,20 @@ final class PlaylistEngine {
                 playClip(id: next)
             } else {
                 currentFrameIndex = 1
+                endingSoonFired = false
             }
         } else {
             holdingAtEnd = true
             pendingNextID = next
         }
+    }
+
+    private func notifyEndingSoonIfNeeded(clip: PetClip) {
+        guard !endingSoonFired, clip.fps > 0 else { return }
+        let remaining = Double(clip.frameCount - currentFrameIndex) / clip.fps
+        guard remaining <= endingSoonLeadTime else { return }
+        endingSoonFired = true
+        clipEndingSoonHandler?(max(0, remaining))
     }
 
     private func pickNext(after clip: PetClip, store: LibraryStore) -> String? {

@@ -17,6 +17,12 @@ enum PlaybackMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Behaviour tags a clip can carry (extensible string constants).
+enum ClipTag {
+    /// Played when the user taps/pets the cat.
+    static let petting = "petting"
+}
+
 struct PetClip: Codable, Identifiable, Equatable, Hashable {
     var id: String
     var name: String
@@ -32,6 +38,8 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
     var createdAt: Date
     /// How many times this clip has been started by the playlist engine.
     var playCount: Int
+    /// Behaviour tags (see ClipTag).
+    var tags: [String]
 
     var framesDirectoryName: String { id }
 
@@ -74,6 +82,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
     enum CodingKeys: String, CodingKey {
         case id, name, sourcePath, frameCount, fps, displayWidth, displayHeight
         case firstFingerprint, lastFingerprint, nextClipIDs, createdAt, playCount
+        case tags
     }
 
     init(
@@ -88,7 +97,8 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
         lastFingerprint: [Float],
         nextClipIDs: [String],
         createdAt: Date,
-        playCount: Int = 0
+        playCount: Int = 0,
+        tags: [String] = []
     ) {
         self.id = id
         self.name = name
@@ -102,6 +112,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
         self.nextClipIDs = nextClipIDs
         self.createdAt = createdAt
         self.playCount = playCount
+        self.tags = tags
     }
 
     init(from decoder: Decoder) throws {
@@ -118,6 +129,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
         nextClipIDs = try c.decode([String].self, forKey: .nextClipIDs)
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         playCount = try c.decodeIfPresent(Int.self, forKey: .playCount) ?? 0
+        tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
     }
 }
 

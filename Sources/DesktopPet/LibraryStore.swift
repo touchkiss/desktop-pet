@@ -297,6 +297,17 @@ final class LibraryStore {
         }
     }
 
+    func toggleTag(clipID: String, tag: String) {
+        update { s in
+            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
+            if let existing = s.clips[idx].tags.firstIndex(of: tag) {
+                s.clips[idx].tags.remove(at: existing)
+            } else {
+                s.clips[idx].tags.append(tag)
+            }
+        }
+    }
+
     func renameClip(id: String, to newName: String) {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }

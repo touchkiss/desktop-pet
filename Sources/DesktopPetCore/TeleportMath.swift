@@ -57,6 +57,184 @@ public enum TeleportMath {
         guard nudgeEnabled else { return .corner }
         return clamp01(unitRandom) < 0.25 ? .cursorNudge : .corner
     }
+
+    /// Probability that a trip shows the travel streak — not every trip,
+    /// so the "now you see me" surprise survives.
+    public static let travelStreakChance = 0.5
+
+    public static func shouldShowTravelStreak(unitRandom: Double) -> Bool {
+        clamp01(unitRandom) < travelStreakChance
+    }
+
+    /// Styles the travel streak pairs well with. Wipe-style and in-place
+    /// styles read as overkill with a bridge flying between the points.
+    public static func styleSupportsStreak(_ style: TeleportEffectStyle) -> Bool {
+        switch style {
+        case .blink, .smear, .ink:
+            return true
+        case .particles, .beam, .pixel, .scanline, .develop, .swarm:
+            return false
+        }
+    }
+
+    /// Some styles come as a PAIR: if either end draws them, the whole trip
+    /// uses them on both ends. Swarm is a single integrated journey; ink
+    /// dissolves, an ink-wash bridge carries it, ink blooms back.
+    public static func resolveStylePair(
+        vanishDraw: TeleportEffectStyle,
+        appearDraw: TeleportEffectStyle
+    ) -> (vanish: TeleportEffectStyle, appear: TeleportEffectStyle) {
+        if vanishDraw == .swarm || appearDraw == .swarm {
+            return (.swarm, .swarm)
+        }
+        if vanishDraw == .ink || appearDraw == .ink {
+            return (.ink, .ink)
+        }
+        return (vanishDraw, appearDraw)
+    }
+
+    /// Pick the bridge between the two ends. Whirlwind trips ride the
+    /// twisting vortex; blink pairs favour shadow hops; move-style pairs
+    /// draw from the whole family; wipe/in-place pairs go bridgeless.
+    public static func pickTravelMiddle(
+        vanishStyle: TeleportEffectStyle,
+        appearStyle: TeleportEffectStyle,
+        unitRandom: Double
+    ) -> TravelMiddle {
+        let r = clamp01(unitRandom)
+        if vanishStyle == .swarm || appearStyle == .swarm {
+            // The swarm IS its own bridge — never stack another one.
+            return .none
+        }
+        if vanishStyle == .ink && appearStyle == .ink {
+            // Ink rides ink: a wash-toned comet or twisting strands.
+            if r < 0.5 { return .comet }
+            return r < 0.8 ? .vortex : .shadowHops
+        }
+        if vanishStyle == .blink && appearStyle == .blink {
+            if r < 0.55 { return .shadowHops }
+            return r < 0.8 ? .comet : .vortex
+        }
+        if styleSupportsStreak(vanishStyle) && styleSupportsStreak(appearStyle) {
+            if r < 0.35 { return .comet }
+            if r < 0.6 { return .cloud }
+            if r < 0.8 { return .vortex }
+            return .shadowHops
+        }
+        return .none
+    }
+
+    /// Point at `fraction` (0…1) of the way along the polyline
+    /// from → waypoints → to, measured by arc length.
+    public static func pointAlongPolyline(
+        from: CGPoint,
+        to: CGPoint,
+        waypoints: [CGPoint],
+        fraction: Double
+    ) -> CGPoint {
+        let points = [from] + waypoints + [to]
+        let total = travelPathLength(from: from, to: to, waypoints: waypoints)
+        guard total > 0.001 else { return from }
+        var remaining = clamp01(fraction) * total
+        for i in 0..<(points.count - 1) {
+            let a = points[i]
+            let b = points[i + 1]
+            let segment = Double(hypot(b.x - a.x, b.y - a.y))
+            if remaining <= segment || i == points.count - 2 {
+                let t = segment > 0.001 ? CGFloat(min(1, remaining / segment)) : 0
+                return CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+            }
+            remaining -= segment
+        }
+        return to
+    }
+
+    /// Vanish and appear styles are picked independently; the streak only
+    /// flies when BOTH ends can hand off to it.
+    public static func streakAllowed(
+        vanishStyle: TeleportEffectStyle,
+        appearStyle: TeleportEffectStyle
+    ) -> Bool {
+        styleSupportsStreak(vanishStyle) && styleSupportsStreak(appearStyle)
+    }
+
+    /// Travel-streak flight time by path length (points): clamp(0.3, d/2400, 0.85).
+    public static func travelDuration(distance: Double) -> Double {
+        min(0.85, max(0.3, distance / 2400))
+    }
+
+    /// Intermediate waypoints for a WINDING streak: 1–3 turns that swing to
+    /// alternating sides of the chord. Start/end are not included.
+    /// Randoms consumed in order: turn count, starting side, then per turn
+    /// (position jitter, amplitude).
+    public static func travelWaypoints(
+        from: CGPoint,
+        to: CGPoint,
+        unitRandoms: [Double]
+    ) -> [CGPoint] {
+        let dx = Double(to.x - from.x)
+        let dy = Double(to.y - from.y)
+        let length = hypot(dx, dy)
+        guard length > 1 else { return [] }
+        var ri = 0
+        func next() -> Double {
+            defer { ri += 1 }
+            return ri < unitRandoms.count ? clamp01(unitRandoms[ri]) : 0.5
+        }
+        let turns = 1 + Int(next() * 2.999)
+        let nx = -dy / length
+        let ny = dx / length
+        var side: Double = next() < 0.5 ? 1 : -1
+        var points: [CGPoint] = []
+        for i in 1...turns {
+            let baseT = Double(i) / Double(turns + 1)
+            let t = min(0.92, max(0.08, baseT + (next() - 0.5) * 0.12))
+            let amplitude = length * lerp(0.10, 0.22, next()) * side
+            side = -side
+            points.append(CGPoint(
+                x: Double(from.x) + dx * t + nx * amplitude,
+                y: Double(from.y) + dy * t + ny * amplitude
+            ))
+        }
+        return points
+    }
+
+    /// Polyline length through the waypoints — feeds travelDuration so a
+    /// winding flight takes proportionally longer than a straight one.
+    public static func travelPathLength(
+        from: CGPoint,
+        to: CGPoint,
+        waypoints: [CGPoint]
+    ) -> Double {
+        var total = 0.0
+        var previous = from
+        for point in waypoints + [to] {
+            total += Double(hypot(point.x - previous.x, point.y - previous.y))
+            previous = point
+        }
+        return total
+    }
+
+    /// Control point of the streak's quadratic bezier arc: perpendicular to
+    /// the chord at its midpoint, offset lerp(0.12, 0.20, bulgeUnit) × chord
+    /// length, on the side chosen by sideUnit (< 0.5 → left normal).
+    public static func travelControlPoint(
+        from: CGPoint,
+        to: CGPoint,
+        bulgeUnit: Double,
+        sideUnit: Double
+    ) -> CGPoint {
+        let mid = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
+        let dx = Double(to.x - from.x)
+        let dy = Double(to.y - from.y)
+        let length = hypot(dx, dy)
+        guard length > 0.001 else { return mid }
+        let nx = -dy / length
+        let ny = dx / length
+        let side: Double = clamp01(sideUnit) < 0.5 ? 1 : -1
+        let bulge = lerp(0.12, 0.20, bulgeUnit) * length * side
+        return CGPoint(x: mid.x + CGFloat(nx * bulge), y: mid.y + CGFloat(ny * bulge))
+    }
 }
 
 public struct TeleportScreenBox: Equatable, Sendable {

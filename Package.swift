@@ -17,7 +17,8 @@ let package = Package(
             dependencies: ["DesktopPetCore"],
             path: "Sources/DesktopPet",
             linkerSettings: [
-                .linkedFramework("ServiceManagement")
+                .linkedFramework("ServiceManagement"),
+                .linkedFramework("Carbon")
             ]
         ),
         .testTarget(

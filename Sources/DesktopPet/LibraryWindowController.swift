@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import UniformTypeIdentifiers
 
 @MainActor
@@ -139,6 +140,8 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         deleteBtn.bezelStyle = .rounded
         let rebuildBtn = NSButton(title: "重算衔接", target: self, action: #selector(rebuildLinks))
         rebuildBtn.bezelStyle = .rounded
+        let exportBtn = NSButton(title: "导出 GIF…", target: self, action: #selector(exportSelectedClip))
+        exportBtn.bezelStyle = .rounded
         countLabel.font = .systemFont(ofSize: 12, weight: .medium)
         countLabel.textColor = .secondaryLabelColor
 
@@ -151,6 +154,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         row.addArrangedSubview(clearQueueBtn)
         row.addArrangedSubview(deleteBtn)
         row.addArrangedSubview(rebuildBtn)
+        row.addArrangedSubview(exportBtn)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(countLabel)
         bar.addSubview(row)
@@ -252,6 +256,11 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             self.store.renameClip(id: clipID, to: newName)
             NotificationCenter.default.post(name: .libraryDidChange, object: nil)
             self.reload(preservingSelection: true)
+        }
+        detail.onToggleTag = { [weak self] clipID, tag in
+            guard let self else { return }
+            self.store.toggleTag(clipID: clipID, tag: tag)
+            NotificationCenter.default.post(name: .libraryDidChange, object: nil)
         }
 
         body.addSubview(listPane)
@@ -674,6 +683,37 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         reload()
     }
 
+    @objc private func exportSelectedClip() {
+        guard let clip = selectedClip(), let window else { return }
+        let index = store.state.clips.firstIndex(where: { $0.id == clip.id }) ?? 0
+
+        let panel = NSSavePanel()
+        let formatPopup = NSPopUpButton(frame: NSRect(x: 10, y: 4, width: 220, height: 26))
+        formatPopup.addItems(withTitles: ["GIF（兼容表情包）", "APNG（无损透明）"])
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 34))
+        accessory.addSubview(formatPopup)
+        panel.accessoryView = accessory
+        panel.allowedContentTypes = [.gif, .png]
+        panel.nameFieldStringValue = clip.displayTitle(indexInLibrary: index)
+
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, var url = panel.url else { return }
+            let useAPNG = formatPopup.indexOfSelectedItem == 1
+            let wantedExtension = useAPNG ? "png" : "gif"
+            if url.pathExtension.lowercased() != wantedExtension {
+                url.deletePathExtension()
+                url.appendPathExtension(wantedExtension)
+            }
+            let ok = ClipExporter.export(clip: clip, to: url, apng: useAPNG)
+            let alert = NSAlert()
+            alert.messageText = ok ? "导出完成" : "导出失败"
+            alert.informativeText = ok ? url.lastPathComponent : "无法写入所选位置。"
+            if let window = self.window {
+                alert.beginSheetModal(for: window) { _ in }
+            }
+        }
+    }
+
     @objc private func rebuildLinks() {
         let linkCount = store.rebuildAutoLinks()
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
@@ -997,10 +1037,12 @@ final class ThumbnailCacheBox {
 final class DetailPanel: NSView {
     var onToggleNext: ((String, String, Bool) -> Void)?
     var onRename: ((String, String) -> Void)?
+    var onToggleTag: ((String, String) -> Void)?
 
     private let scroll = NSScrollView()
     private let stack = NSStackView()
     private let documentView = FlippedClipView()
+    private let preview = ClipPreviewPlayer()
     private var clipID: String?
     private var shownClipID: String?
 
@@ -1101,6 +1143,7 @@ final class DetailPanel: NSView {
     }
 
     private func clearStack() {
+        preview.stop()
         stack.arrangedSubviews.forEach {
             stack.removeArrangedSubview($0)
             $0.removeFromSuperview()
@@ -1134,6 +1177,19 @@ final class DetailPanel: NSView {
         renameBtn.bezelStyle = .rounded
         renameBtn.identifier = NSUserInterfaceItemIdentifier(clip.id)
         stack.addArrangedSubview(renameBtn)
+
+        let pettingToggle = NSButton(
+            checkboxWithTitle: "被摸反应片段（点按猫咪时播放）",
+            target: self,
+            action: #selector(togglePettingTag(_:))
+        )
+        pettingToggle.state = clip.tags.contains(ClipTag.petting) ? .on : .off
+        pettingToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
+        stack.addArrangedSubview(pettingToggle)
+
+        // Full-motion preview of the keyed frame sequence.
+        stack.addArrangedSubview(preview)
+        preview.load(clip: clip)
 
         let frames = NSStackView()
         frames.orientation = .horizontal
@@ -1221,11 +1277,286 @@ final class DetailPanel: NSView {
         guard let clipID, let nextID = sender.identifier?.rawValue else { return }
         onToggleNext?(clipID, nextID, sender.state == .on)
     }
+
+    @objc private func togglePettingTag(_ sender: NSButton) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        onToggleTag?(clipID, ClipTag.petting)
+    }
+}
+
+// MARK: - Full-clip preview player
+
+/// Loops a clip's keyed transparent PNG frame sequence at its native fps,
+/// with play/pause, a scrubber, and a frame counter — so the detail pane
+/// previews the whole motion instead of only first/last frames.
+@MainActor
+final class ClipPreviewPlayer: NSView {
+    private let imageView = NSImageView()
+    private let playButton = NSButton()
+    private let slider = NSSlider()
+    private let frameLabel = NSTextField(labelWithString: "")
+    private var timer: Timer?
+    private var clipID: String?
+    private var frameCount = 1
+    private var fps: Double = 24
+    private var currentFrame = 1
+    private var isPlayingPreview = false
+    private var cache: [Int: NSImage] = [:]
+    private var cacheOrder: [Int] = []
+    private let cacheLimit = 40
+
+    /// Checkerboard pattern so the alpha channel reads clearly.
+    private static let checkerboard: NSColor = {
+        let side: CGFloat = 16
+        let half = side / 2
+        let image = NSImage(size: NSSize(width: side, height: side))
+        image.lockFocus()
+        NSColor(calibratedWhite: 0.92, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: side, height: side).fill()
+        NSColor(calibratedWhite: 0.82, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: half, height: half).fill()
+        NSRect(x: half, y: half, width: half, height: half).fill()
+        image.unlockFocus()
+        return NSColor(patternImage: image)
+    }()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setup() {
+        wantsLayer = true
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.wantsLayer = true
+        imageView.layer?.backgroundColor = Self.checkerboard.cgColor
+        imageView.layer?.cornerRadius = 8
+        imageView.layer?.masksToBounds = true
+        imageView.layer?.borderWidth = 0.5
+        imageView.layer?.borderColor = NSColor.separatorColor.cgColor
+        addSubview(imageView)
+
+        playButton.bezelStyle = .rounded
+        playButton.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: "暂停")
+        playButton.target = self
+        playButton.action = #selector(togglePlay)
+        playButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(playButton)
+
+        slider.minValue = 1
+        slider.maxValue = 1
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(sliderMoved)
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(slider)
+
+        frameLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        frameLabel.textColor = .secondaryLabelColor
+        frameLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(frameLabel)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 260),
+
+            imageView.topAnchor.constraint(equalTo: topAnchor),
+            imageView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            imageView.widthAnchor.constraint(equalToConstant: 240),
+            imageView.heightAnchor.constraint(equalToConstant: 240),
+
+            playButton.topAnchor.constraint(equalTo: imageView.bottomAnchor, constant: 8),
+            playButton.leadingAnchor.constraint(equalTo: leadingAnchor),
+            playButton.widthAnchor.constraint(equalToConstant: 34),
+
+            slider.centerYAnchor.constraint(equalTo: playButton.centerYAnchor),
+            slider.leadingAnchor.constraint(equalTo: playButton.trailingAnchor, constant: 8),
+            slider.widthAnchor.constraint(equalToConstant: 126),
+
+            frameLabel.centerYAnchor.constraint(equalTo: playButton.centerYAnchor),
+            frameLabel.leadingAnchor.constraint(equalTo: slider.trailingAnchor, constant: 8),
+            frameLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
+
+            bottomAnchor.constraint(equalTo: playButton.bottomAnchor)
+        ])
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Leaving the window (detail cleared, library closed) stops playback.
+        if window == nil { stop() }
+    }
+
+    func load(clip: PetClip) {
+        stop()
+        clipID = clip.id
+        frameCount = max(1, clip.frameCount)
+        fps = clip.fps > 0 ? clip.fps : 24
+        cache.removeAll()
+        cacheOrder.removeAll()
+        slider.minValue = 1
+        slider.maxValue = Double(frameCount)
+        showFrame(1)
+        startPlaying()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        isPlayingPreview = false
+        updatePlayButton()
+    }
+
+    private func startPlaying() {
+        timer?.invalidate()
+        timer = nil
+        guard frameCount > 1 else {
+            isPlayingPreview = false
+            updatePlayButton()
+            return
+        }
+        isPlayingPreview = true
+        updatePlayButton()
+        let t = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func tick() {
+        showFrame(currentFrame % frameCount + 1)
+    }
+
+    private func showFrame(_ index: Int) {
+        currentFrame = index
+        imageView.image = frameImage(at: index)
+        slider.doubleValue = Double(index)
+        frameLabel.stringValue = "\(index) / \(frameCount) 帧"
+    }
+
+    private func frameImage(at index: Int) -> NSImage? {
+        guard let clipID else { return nil }
+        if let hit = cache[index] { return hit }
+        let url = AppPaths.frameURL(clipID: clipID, index: index)
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        cache[index] = image
+        cacheOrder.append(index)
+        if cacheOrder.count > cacheLimit {
+            let evicted = cacheOrder.removeFirst()
+            cache.removeValue(forKey: evicted)
+        }
+        return image
+    }
+
+    private func updatePlayButton() {
+        let symbol = isPlayingPreview ? "pause.fill" : "play.fill"
+        let label = isPlayingPreview ? "暂停" : "播放"
+        playButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+    }
+
+    @objc private func togglePlay() {
+        if isPlayingPreview {
+            stop()
+        } else {
+            startPlaying()
+        }
+    }
+
+    @objc private func sliderMoved() {
+        // Scrubbing pauses playback; hit play to resume from here.
+        if isPlayingPreview { stop() }
+        let index = max(1, min(frameCount, Int(slider.doubleValue.rounded())))
+        showFrame(index)
+    }
 }
 
 /// Top-left origin document view so growing content doesn't jump the scroll position.
 private final class FlippedClipView: NSView {
     override var isFlipped: Bool { true }
+}
+
+// MARK: - Clip export (GIF / APNG stickers)
+
+enum ClipExporter {
+    /// Assemble the keyed frame sequence into a looping GIF or APNG.
+    /// Caps at ~60 frames (striding) and 480px on the long side.
+    static func export(clip: PetClip, to url: URL, apng: Bool) -> Bool {
+        let maxFrames = 60
+        let step = max(1, Int(ceil(Double(clip.frameCount) / Double(maxFrames))))
+        var indices: [Int] = []
+        var cursor = 1
+        while cursor <= clip.frameCount {
+            indices.append(cursor)
+            cursor += step
+        }
+        guard !indices.isEmpty else { return false }
+        let delay = Double(step) / max(1.0, clip.fps)
+
+        let typeIdentifier = (apng ? UTType.png : UTType.gif).identifier as CFString
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, typeIdentifier, indices.count, nil
+        ) else { return false }
+
+        if apng {
+            let fileProperties = [
+                kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGLoopCount: 0]
+            ] as CFDictionary
+            CGImageDestinationSetProperties(destination, fileProperties)
+        } else {
+            let fileProperties = [
+                kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]
+            ] as CFDictionary
+            CGImageDestinationSetProperties(destination, fileProperties)
+        }
+
+        for index in indices {
+            let frameURL = AppPaths.frameURL(clipID: clip.id, index: index)
+            guard let image = NSImage(contentsOf: frameURL) else { continue }
+            var proposedRect = CGRect(origin: .zero, size: image.size)
+            guard let cg = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
+                continue
+            }
+            let scaled = downscale(cg, maxSide: 480)
+            let frameProperties: CFDictionary
+            if apng {
+                frameProperties = [
+                    kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGDelayTime: delay]
+                ] as CFDictionary
+            } else {
+                frameProperties = [
+                    kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay]
+                ] as CFDictionary
+            }
+            CGImageDestinationAddImage(destination, scaled, frameProperties)
+        }
+        return CGImageDestinationFinalize(destination)
+    }
+
+    private static func downscale(_ image: CGImage, maxSide: CGFloat) -> CGImage {
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let scale = min(1, maxSide / max(width, height))
+        guard scale < 1 else { return image }
+        let newWidth = Int(width * scale)
+        let newHeight = Int(height * scale)
+        guard let context = CGContext(
+            data: nil,
+            width: newWidth,
+            height: newHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return image }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: newWidth, height: newHeight))
+        return context.makeImage() ?? image
+    }
 }
 
 @MainActor
