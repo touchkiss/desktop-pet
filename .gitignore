@@ -3,3 +3,5 @@ DesktopPet.app/
 .swiftpm/
 *.xcodeproj/
 DerivedData/
+.codegraph
+.idea
