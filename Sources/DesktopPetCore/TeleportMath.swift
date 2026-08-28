@@ -37,9 +37,9 @@ public enum TeleportMath {
         jitteredInterval(base: dwellInterval(frequency: frequency), unitRandom: unitRandom)
     }
 
-    /// Probability of teleporting when a clip finishes. Spec remap: lerp(0.25, 1.0, f).
+    /// Probability of teleporting when a clip finishes: lerp(0.05, 0.20, f).
     public static func clipEndTeleportChance(frequency: Double) -> Double {
-        lerp(0.25, 1.0, frequency)
+        lerp(0.05, 0.20, frequency)
     }
 
     public static func shouldTeleportAtClipEnd(frequency: Double, unitRandom: Double) -> Bool {
@@ -52,10 +52,10 @@ public enum TeleportMath {
         return styles[idx]
     }
 
-    /// When nudgeEnabled, probability 1/4 → cursorNudge.
+    /// When nudgeEnabled, probability 1/20 → cursorNudge.
     public static func pickLandingMode(nudgeEnabled: Bool, unitRandom: Double) -> TeleportLandingMode {
         guard nudgeEnabled else { return .corner }
-        return clamp01(unitRandom) < 0.25 ? .cursorNudge : .corner
+        return clamp01(unitRandom) < 0.05 ? .cursorNudge : .corner
     }
 
     /// Probability that a trip shows the travel streak — not every trip,

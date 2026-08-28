@@ -28,10 +28,26 @@ final class TeleportMathTests: XCTestCase {
     }
 
     func testClipEndTeleportChanceEndpoints() {
-        XCTAssertEqual(TeleportMath.clipEndTeleportChance(frequency: 0), 0.25, accuracy: 0.001)
-        XCTAssertEqual(TeleportMath.clipEndTeleportChance(frequency: 1), 1.0, accuracy: 0.001)
-        XCTAssertTrue(TeleportMath.shouldTeleportAtClipEnd(frequency: 1, unitRandom: 0.99))
-        XCTAssertFalse(TeleportMath.shouldTeleportAtClipEnd(frequency: 0, unitRandom: 0.5))
+        XCTAssertEqual(TeleportMath.clipEndTeleportChance(frequency: 0), 0.05, accuracy: 0.001)
+        XCTAssertEqual(TeleportMath.clipEndTeleportChance(frequency: 1), 0.20, accuracy: 0.001)
+        XCTAssertTrue(TeleportMath.shouldTeleportAtClipEnd(frequency: 1, unitRandom: 0.199))
+        XCTAssertFalse(TeleportMath.shouldTeleportAtClipEnd(frequency: 1, unitRandom: 0.20))
+        XCTAssertFalse(TeleportMath.shouldTeleportAtClipEnd(frequency: 0, unitRandom: 0.05))
+    }
+
+    func testCursorNudgeLandingChanceIsFivePercent() {
+        XCTAssertEqual(
+            TeleportMath.pickLandingMode(nudgeEnabled: true, unitRandom: 0.049),
+            .cursorNudge
+        )
+        XCTAssertEqual(
+            TeleportMath.pickLandingMode(nudgeEnabled: true, unitRandom: 0.05),
+            .corner
+        )
+        XCTAssertEqual(
+            TeleportMath.pickLandingMode(nudgeEnabled: false, unitRandom: 0),
+            .corner
+        )
     }
 
     func testCornerRegionsCountAndContainment() {
