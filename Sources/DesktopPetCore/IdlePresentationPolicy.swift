@@ -5,6 +5,28 @@ public enum IdlePresentationPhase: Equatable, Sendable {
     case manic
 }
 
+public struct PersistedIdleDelay: Codable, Equatable, Sendable {
+    public var value: TimeInterval?
+
+    public init(value: TimeInterval?) {
+        self.value = value
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        value = container.decodeNil() ? nil : try container.decode(TimeInterval.self)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if let value {
+            try container.encode(value)
+        } else {
+            try container.encodeNil()
+        }
+    }
+}
+
 public enum IdlePresentationPolicy {
     public static let supportedIdleDelays: [TimeInterval] = [60, 180, 300, 600, 900, 1800]
     public static let defaultIdleDelay: TimeInterval = 300

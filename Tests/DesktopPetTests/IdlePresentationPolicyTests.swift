@@ -43,4 +43,47 @@ final class IdlePresentationPolicyTests: XCTestCase {
         XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(0.5), 1)
         XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(4), 3)
     }
+
+    func testPersistedIdleDelayDecodesExplicitNullAsNil() throws {
+        let decoded = try JSONDecoder().decode(
+            PersistedIdleDelayFixture.self,
+            from: Data(#"{"manicIdleDelay":null}"#.utf8)
+        )
+
+        XCTAssertNil(decoded.manicIdleDelay)
+    }
+
+    func testPersistedIdleDelayEncodesNilWithExplicitNullKey() throws {
+        let encoded = try JSONEncoder().encode(PersistedIdleDelayFixture(manicIdleDelay: nil))
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+
+        XCTAssertTrue(json.keys.contains("manicIdleDelay"))
+        XCTAssertTrue(json["manicIdleDelay"] is NSNull)
+    }
+
+    func testPersistedIdleDelayRoundTripKeepsClosedState() throws {
+        let encoded = try JSONEncoder().encode(PersistedIdleDelayFixture(manicIdleDelay: nil))
+        let decoded = try JSONDecoder().decode(PersistedIdleDelayFixture.self, from: encoded)
+
+        XCTAssertNil(decoded.manicIdleDelay)
+    }
+}
+
+private struct PersistedIdleDelayFixture: Codable {
+    private var manicIdleDelayStorage: PersistedIdleDelay
+
+    var manicIdleDelay: TimeInterval? {
+        get { manicIdleDelayStorage.value }
+        set { manicIdleDelayStorage = PersistedIdleDelay(value: newValue) }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case manicIdleDelayStorage = "manicIdleDelay"
+    }
+
+    init(manicIdleDelay: TimeInterval?) {
+        manicIdleDelayStorage = PersistedIdleDelay(value: manicIdleDelay)
+    }
 }
