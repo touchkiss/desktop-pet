@@ -36,4 +36,11 @@ final class IdlePresentationPolicyTests: XCTestCase {
             2.5
         )
     }
+
+    func testPersistedManicScaleUsesSafeDefaultAndBounds() {
+        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(nil), 2)
+        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(.nan), 2)
+        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(0.5), 1)
+        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(4), 3)
+    }
 }

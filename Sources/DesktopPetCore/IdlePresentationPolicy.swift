@@ -26,6 +26,10 @@ public enum IdlePresentationPolicy {
         return min(maximumManicScale, max(minimumManicScale, scale))
     }
 
+    public static func resolvedManicScale(_ storedValue: Double?) -> Double {
+        clampedManicScale(storedValue ?? defaultManicScale)
+    }
+
     public static func phase(
         idleSeconds: TimeInterval,
         delay: TimeInterval?
