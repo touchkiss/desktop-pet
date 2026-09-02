@@ -18,7 +18,8 @@ let package = Package(
             path: "Sources/DesktopPet",
             linkerSettings: [
                 .linkedFramework("ServiceManagement"),
-                .linkedFramework("Carbon")
+                .linkedFramework("Carbon"),
+                .linkedFramework("IOKit")
             ]
         ),
         .testTarget(
