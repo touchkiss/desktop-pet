@@ -1,11 +1,12 @@
 import AppKit
+import DesktopPetCore
 
 /// Modal sheet: preview chromakey on sample frames, tune parameters, accept or cancel.
 @MainActor
 final class ChromaKeyPreviewController: NSWindowController {
     private let staging: ImportStaging
     private var settings: ChromaKeySettings
-    private var continuation: CheckedContinuation<ChromaKeySettings?, Never>?
+    private var continuation: CheckedContinuation<ChromaKeyPreviewResult?, Never>?
 
     private let previewStack = NSStackView()
     private let similaritySlider = NSSlider()
@@ -16,6 +17,12 @@ final class ChromaKeyPreviewController: NSWindowController {
     private let despillValue = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "正在生成预览…")
     private let spinner = NSProgressIndicator()
+    private let materialTypeControl = NSSegmentedControl(
+        labels: ["猫猫", "鼠标互动目标素材"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
     private var debounceWork: DispatchWorkItem?
     private var previewGeneration = 0
     private let previewDir: URL
@@ -28,7 +35,7 @@ final class ChromaKeyPreviewController: NSWindowController {
             .appendingPathComponent(staging.clipID, isDirectory: true)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 580),
             styleMask: [.titled],
             backing: .buffered,
             defer: false
@@ -43,7 +50,7 @@ final class ChromaKeyPreviewController: NSWindowController {
     required init?(coder: NSCoder) { fatalError() }
 
     /// Present as a sheet and wait for Accept (settings) or Cancel (nil).
-    func runModal(for parent: NSWindow) async -> ChromaKeySettings? {
+    func runModal(for parent: NSWindow) async -> ChromaKeyPreviewResult? {
         await withCheckedContinuation { continuation in
             self.continuation = continuation
             parent.beginSheet(window!) { _ in }
@@ -51,7 +58,7 @@ final class ChromaKeyPreviewController: NSWindowController {
         }
     }
 
-    private func finish(_ result: ChromaKeySettings?) {
+    private func finish(_ result: ChromaKeyPreviewResult?) {
         debounceWork?.cancel()
         try? FileManager.default.removeItem(at: previewDir)
         if let parent = window?.sheetParent {
@@ -84,6 +91,18 @@ final class ChromaKeyPreviewController: NSWindowController {
         hint.font = .systemFont(ofSize: 11)
         hint.preferredMaxLayoutWidth = 720
         root.addArrangedSubview(hint)
+
+        let materialRow = NSStackView()
+        materialRow.orientation = .horizontal
+        materialRow.spacing = 10
+        let materialLabel = NSTextField(labelWithString: "素材类型")
+        materialLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        materialTypeControl.selectedSegment = ClipImportMaterialType.cat.rawValue
+        materialTypeControl.setContentHuggingPriority(.required, for: .horizontal)
+        materialRow.addArrangedSubview(materialLabel)
+        materialRow.addArrangedSubview(materialTypeControl)
+        materialRow.addArrangedSubview(NSView())
+        root.addArrangedSubview(materialRow)
 
         previewStack.orientation = .horizontal
         previewStack.spacing = 12
@@ -251,7 +270,8 @@ final class ChromaKeyPreviewController: NSWindowController {
 
     @objc private func acceptImport() {
         readSettingsFromSliders()
-        finish(settings)
+        let materialType = ClipImportMaterialType(rawValue: materialTypeControl.selectedSegment) ?? .cat
+        finish(ChromaKeyPreviewResult(settings: settings, materialType: materialType))
     }
 
     private func schedulePreview(immediate: Bool) {

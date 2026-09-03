@@ -1,0 +1,304 @@
+@@ -105,28 +106,40 @@ final class LibraryStore {
+         for i in state.clips.indices where state.clips[i].hasHashLikeName {
+             state.clips[i].name = "猫猫 \(nextIndex)"
+             nextIndex += 1
+             changed = true
+         }
+         if changed { save() }
+     }
+ 
+-    func save() {
++    @discardableResult
++    func save() -> String? {
+         do {
+             let data = try encoder.encode(state)
+             try data.write(to: AppPaths.libraryURL, options: .atomic)
++            return nil
+         } catch {
+-            lastError = "保存失败: \(error.localizedDescription)"
++            let saveError = "保存失败: \(error.localizedDescription)"
++            if lastError == nil {
++                lastError = saveError
++            }
++            return saveError
+         }
+     }
+ 
+-    func update(_ mutate: (inout LibraryState) -> Void) {
++    @discardableResult
++    func update(_ mutate: (inout LibraryState) -> Void) -> String? {
+         mutate(&state)
+-        save()
++        return save()
++    }
++
++    func consumeLastError(ifMatching error: String) {
++        guard lastError == error else { return }
++        lastError = nil
+     }
+ 
+     func clip(id: String) -> PetClip? {
+         state.clips.first { $0.id == id }
+     }
+ 
+     func removeClip(id: String) {
+--- before/LibraryWindowController.swift
++++ after/LibraryWindowController.swift
+@@ -5,6 +5,11 @@
+ 
+ @MainActor
+ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
++    private struct SettingsErrorAlert: Equatable {
++        let title: String
++        let message: String
++    }
++
+     private let store: LibraryStore
+     private let engine: PlaylistEngine
+ 
+@@ -43,6 +48,8 @@
+     private var isImporting = false
+     private var suppressSelectionSideEffects = false
+     private var selectedTab: ClipLibraryTab = .cats
++    private var settingsErrorQueue: [SettingsErrorAlert] = []
++    private var activeSettingsError: SettingsErrorAlert?
+ 
+     private var visibleClips: [PetClip] {
+         store.state.clips.filter { $0.libraryTab == selectedTab }
+@@ -444,7 +451,7 @@
+         row4.spacing = 12
+         preventIdleDisplaySleepToggle.target = self
+         preventIdleDisplaySleepToggle.action = #selector(idlePresentationSettingsChanged)
+-        let idleDelayLabel = NSTextField(labelWithString: "空闲狂暴展示")
++        let idleDelayLabel = NSTextField(labelWithString: "空闲后放大")
+         manicIdleDelayPopup.removeAllItems()
+         let idleDelayOptions: [(title: String, seconds: TimeInterval?)] = [
+             ("关闭", nil),
+@@ -462,7 +469,7 @@
+         }
+         manicIdleDelayPopup.target = self
+         manicIdleDelayPopup.action = #selector(idlePresentationSettingsChanged)
+-        let manicScaleLabel = NSTextField(labelWithString: "展示倍率")
++        let manicScaleLabel = NSTextField(labelWithString: "魔性倍率")
+         manicScaleSlider.minValue = IdlePresentationPolicy.minimumManicScale
+         manicScaleSlider.maxValue = IdlePresentationPolicy.maximumManicScale
+         manicScaleSlider.doubleValue = store.state.manicScale
+@@ -547,20 +554,7 @@
+         topToggle.state = store.state.alwaysOnTop ? .on : .off
+         clickToggle.state = store.state.clickThrough ? .on : .off
+         launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
+-        preventIdleDisplaySleepToggle.state = store.state.preventIdleDisplaySleep ? .on : .off
+-        let selectedDelayIndex = manicIdleDelayPopup.itemArray.firstIndex { item in
+-            if let representedDelay = item.representedObject as? NSNumber,
+-               let storedDelay = store.state.manicIdleDelay {
+-                return representedDelay.doubleValue == storedDelay
+-            }
+-            return item.representedObject is NSNull && store.state.manicIdleDelay == nil
+-        }
+-        if let selectedDelayIndex {
+-            manicIdleDelayPopup.selectItem(at: selectedDelayIndex)
+-        }
+-        manicScaleSlider.doubleValue = store.state.manicScale
+-        manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
+-        manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
++        refreshIdlePresentationControls()
+         autoLinkToggle.state = store.state.autoLinkEnabled ? .on : .off
+         scaleSlider.doubleValue = store.state.petScale
+         thresholdSlider.doubleValue = store.state.autoLinkThreshold
+@@ -1004,24 +998,74 @@
+ 
+     @objc private func idlePresentationSettingsChanged() {
+         let delay = (manicIdleDelayPopup.selectedItem?.representedObject as? NSNumber)?.doubleValue
+-        store.update {
++        let previousLastError = store.lastError
++        let saveError = store.update {
+             $0.preventIdleDisplaySleep = preventIdleDisplaySleepToggle.state == .on
+             $0.manicIdleDelay = delay
+             $0.manicScale = IdlePresentationPolicy.clampedManicScale(manicScaleSlider.doubleValue)
+         }
+         manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
+         manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
+-        NotificationCenter.default.post(name: .libraryDidChange, object: nil)
++        if let saveError {
++            if previousLastError == nil {
++                store.consumeLastError(ifMatching: saveError)
++            }
++            presentIdleSettingsSaveError(saveError)
++        }
++        NotificationCenter.default.post(name: .idlePresentationSettingsDidChange, object: nil)
++    }
++
++    func refreshIdlePresentationControls() {
++        preventIdleDisplaySleepToggle.state = store.state.preventIdleDisplaySleep ? .on : .off
++        let selectedDelayIndex = manicIdleDelayPopup.itemArray.firstIndex { item in
++            if let representedDelay = item.representedObject as? NSNumber,
++               let storedDelay = store.state.manicIdleDelay {
++                return representedDelay.doubleValue == storedDelay
++            }
++            return item.representedObject is NSNull && store.state.manicIdleDelay == nil
++        }
++        if let selectedDelayIndex {
++            manicIdleDelayPopup.selectItem(at: selectedDelayIndex)
++        }
++        manicScaleSlider.doubleValue = store.state.manicScale
++        manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
++        manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
+     }
+ 
++    func presentIdleSettingsSaveError(_ message: String) {
++        enqueueSettingsError(
++            title: "保存设置失败",
++            message: "本次运行中已生效，但未写入磁盘，重启后可能恢复旧值。\n\n\(message)"
++        )
++    }
++
+     func presentIdleDisplaySleepError(_ message: String) {
+-        let alert = NSAlert()
+-        alert.messageText = "无法阻止自动关闭屏幕"
+-        alert.informativeText = message
++        enqueueSettingsError(title: "无法阻止自动关闭屏幕", message: message)
++    }
++
++    private func enqueueSettingsError(title: String, message: String) {
++        let item = SettingsErrorAlert(title: title, message: message)
++        guard activeSettingsError != item, !settingsErrorQueue.contains(item) else { return }
++        settingsErrorQueue.append(item)
++        presentNextSettingsError()
++    }
++
++    private func presentNextSettingsError() {
++        guard activeSettingsError == nil, !settingsErrorQueue.isEmpty else { return }
++        let item = settingsErrorQueue.removeFirst()
++        activeSettingsError = item
++        let alert = NSAlert()
++        alert.messageText = item.title
++        alert.informativeText = item.message
+         if let window, window.isVisible {
+-            alert.beginSheetModal(for: window)
++            alert.beginSheetModal(for: window) { [weak self] _ in
++                self?.activeSettingsError = nil
++                self?.presentNextSettingsError()
++            }
+         } else {
+             alert.runModal()
++            activeSettingsError = nil
++            presentNextSettingsError()
+         }
+     }
+ 
+--- before/AppDelegate.swift
++++ after/AppDelegate.swift
+@@ -101,6 +101,15 @@
+                 self?.handleLibraryChange()
+             }
+         }
++        NotificationCenter.default.addObserver(
++            forName: .idlePresentationSettingsDidChange,
++            object: nil,
++            queue: .main
++        ) { [weak self] _ in
++            Task { @MainActor in
++                self?.handleIdlePresentationSettingsChange()
++            }
++        }
+ 
+         if store.state.clips.isEmpty {
+             bootstrapSampleIfNeeded()
+@@ -149,8 +158,6 @@
+     private func handleLibraryChange() {
+         teleportController?.syncFromStore()
+         petWindow?.applyWindowFlags()
+-        synchronizeIdleDisplaySleep()
+-        updateIdlePresentation()
+         if engine.currentClipID == nil, let id = store.state.playableClips.first?.id {
+             engine.playClip(id: id)
+         } else if let id = engine.currentClipID, store.clip(id: id) == nil {
+@@ -182,29 +189,49 @@
+         }
+     }
+ 
++    private func handleIdlePresentationSettingsChange() {
++        synchronizeIdleDisplaySleep()
++        updateIdlePresentation(forceRefresh: true)
++    }
++
+     private func synchronizeIdleDisplaySleep() {
+         guard !isRecoveringDisplaySleepSetting else { return }
+         do {
+             try idleDisplaySleepController.setEnabled(store.state.preventIdleDisplaySleep)
+         } catch {
+             isRecoveringDisplaySleepSetting = true
+-            store.update { $0.preventIdleDisplaySleep = false }
++            let previousLastError = store.lastError
++            let saveError = store.update { $0.preventIdleDisplaySleep = false }
+             isRecoveringDisplaySleepSetting = false
++            if let saveError {
++                if previousLastError == nil {
++                    store.consumeLastError(ifMatching: saveError)
++                }
++                libraryWindow?.presentIdleSettingsSaveError(saveError)
++            }
++            libraryWindow?.refreshIdlePresentationControls()
+             libraryWindow?.presentIdleDisplaySleepError(error.localizedDescription)
+-            NotificationCenter.default.post(name: .libraryDidChange, object: nil)
+         }
+     }
+ 
+-    private func updateIdlePresentation() {
+-        let rawIdle = CGEventSource.secondsSinceLastEventType(
+-            .hidSystemState,
+-            eventType: .null
+-        )
++    private func updateIdlePresentation(forceRefresh: Bool = false) {
++        let rawIdle = HIDIdleTimeQuery.secondsSinceAnyInput { eventTypeRawValue in
++            guard let eventType = CGEventType(rawValue: eventTypeRawValue) else { return 0 }
++            return CGEventSource.secondsSinceLastEventType(
++                .hidSystemState,
++                eventType: eventType
++            )
++        }
+         let phase = IdlePresentationPolicy.phase(
+             idleSeconds: rawIdle,
+             delay: store.state.manicIdleDelay
+         )
+-        guard phase != currentIdlePresentationPhase else { return }
++        guard phase != currentIdlePresentationPhase else {
++            if forceRefresh {
++                petWindow?.refreshFrame()
++            }
++            return
++        }
+         currentIdlePresentationPhase = phase
+         petWindow?.setIdlePresentationPhase(phase)
+     }
+diff --git a/docs/superpowers/specs/2026-09-02-idle-display-and-manic-scale-design.md b/docs/superpowers/specs/2026-09-02-idle-display-and-manic-scale-design.md
+index 79f17de..1d72ce8 100644
+--- a/docs/superpowers/specs/2026-09-02-idle-display-and-manic-scale-design.md
++++ b/docs/superpowers/specs/2026-09-02-idle-display-and-manic-scale-design.md
+@@ -76,22 +76,25 @@
+ ## 片段库交互
+ 
+ 在现有全局设置区域增加一行紧凑控件：
+ 
+ - checkbox：“阻止自动锁屏与关闭屏幕”；
+ - 标签与下拉框：“空闲后放大”及固定时间选项；
+ - 标签与滑块：“魔性倍率”，旁边显示当前倍率文本。
+ 
+-修改设置后立即保存并广播现有的 library change 通知。选择“关闭”时倍率滑块保留上次值但置灰；再次启用时恢复使用该值。显示保护创建失败时 checkbox 自动关闭，并显示包含系统错误码的提示。
++修改设置后立即尝试保存，并广播专用的 idle presentation settings 通知。`AppDelegate` 只在该通知路径中同步显示休眠断言、重新评估阶段和刷新倍率，不进入通用 library change 的播放重调度流程，也不清除传送期间的 hold、pending next 或 one-shot 状态。
++
++保存失败时，设置仍在当前进程中生效，专用通知也照常发送；界面立即以“保存设置失败”提示未写入磁盘，并说明重启后可能恢复旧值。选择“关闭”时倍率滑块保留上次值但置灰；再次启用时恢复使用该值。显示保护创建失败时 checkbox 自动关闭，并显示包含系统错误码的提示。
+ 
+ ## 错误处理与生命周期
+ 
+ - IOKit 断言创建失败：不保留错误的开启状态，向用户报告，应用其余功能不受影响。
+ - IOKit 断言释放失败：清除本地持有状态并记录可展示错误，避免后续逻辑误认为断言仍有效。
++- 设置保存失败：保留当前进程中的设置并继续同步运行时行为，立即提示磁盘未写入及重启回滚风险；不得将该错误延迟成“导入失败”。
+ - 空闲时间 API 返回非有限值或负值：本次采样按 `0` 处理，不误触发放大。
+ - 当前屏幕不可用或尺寸异常：沿用当前窗口位置与正常刷新回退，不生成无效窗口 frame。
+ - 应用退出：先释放显示保护断言，再终止应用。
+ - 手动锁屏：应用不截获 `Control-Command-Q`、系统菜单锁屏、合盖或主动睡眠。
+ 
+ ## 测试策略
+ 
+ XCTest 覆盖 `DesktopPetCore` 中的确定性规则：

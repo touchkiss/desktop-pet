@@ -111,6 +111,8 @@ final class PetWindowController: NSWindowController {
     private var frameCache: (clipID: String, index: Int, image: NSImage)?
     private var petDisplaySize: CGSize = .zero
     private var effectPadding: CGFloat = 0
+    private var geometryRefreshState = DeferredGeometryRefreshState()
+    private(set) var idlePresentationPhase: IdlePresentationPhase = .normal
 
     var onTeleportDragCancel: (() -> Void)?
     /// Quick click on the cat — petting.
@@ -124,16 +126,12 @@ final class PetWindowController: NSWindowController {
     /// Fired for every rendered frame (even suppressed ones) so an in-flight
     /// teleport effect can feed live frames into its staging layers.
     var onFrameRendered: ((NSImage) -> Void)?
+    /// Reports a concrete frame that exists in metadata but cannot be decoded.
+    var onFrameLoadFailed: ((String, Int) -> Void)?
 
     /// While a teleport effect owns the visuals, the live view stays blank
     /// (the effect shows the frames instead) but frames keep flowing above.
     var suppressLiveImageForEffect = false
-
-    /// While a teleport trip is in flight the CONTROLLER owns the window
-    /// geometry: refreshFrame keeps updating images but must not move or
-    /// resize the window, killing every tick-ordering race that made the
-    /// cat hop after reappearing.
-    var freezeFrameForTeleport = false
 
     var effectHost: PetContentView { contentView }
 
@@ -187,6 +185,12 @@ final class PetWindowController: NSWindowController {
         )
         NotificationCenter.default.addObserver(
             self,
+            selector: #selector(libraryChanged),
+            name: .petPresentationDidChange,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
             selector: #selector(persistPosition(_:)),
             name: .petPositionDidChange,
             object: nil
@@ -200,6 +204,35 @@ final class PetWindowController: NSWindowController {
 
     func currentPetFrame() -> CGRect {
         window?.frame ?? .zero
+    }
+
+    func setIdlePresentationPhase(_ phase: IdlePresentationPhase) {
+        guard idlePresentationPhase != phase else { return }
+        idlePresentationPhase = phase
+        refreshFrame()
+    }
+
+    func beginTeleportGeometryFreeze() {
+        geometryRefreshState.beginFreeze()
+    }
+
+    /// Applies one final geometry refresh when scale or clip size changed
+    /// while the teleport renderer owned the window frame.
+    @discardableResult
+    func endTeleportGeometryFreeze() -> Bool {
+        guard geometryRefreshState.endFreeze() else { return false }
+        refreshFrame()
+        return true
+    }
+
+    func effectiveDisplaySize(for clip: PetClip) -> CGSize {
+        clip.effectiveDisplaySize(
+            globalScale: store.state.petScale,
+            presentationMultiplier: IdlePresentationPolicy.presentationMultiplier(
+                manicScale: store.state.manicScale,
+                phase: idlePresentationPhase
+            )
+        )
     }
 
     /// Snapshot of the current pet image (for the tile-swarm journey).
@@ -227,13 +260,20 @@ final class PetWindowController: NSWindowController {
     /// Called by the teleport controller while frames are frozen, so the
     /// effect, its canvas and the final live window all share ONE rect.
     func setTeleportLandingFrame(center: CGPoint, size: CGSize) {
-        guard let window, size.width > 0, size.height > 0 else { return }
+        guard let window,
+              center.x.isFinite,
+              center.y.isFinite,
+              PetClipPresentationPolicy.isValidDisplaySize(size) else {
+            return
+        }
         var origin = CGPoint(x: center.x - size.width / 2, y: center.y - size.height / 2)
         let screen = NSScreen.screens.first { $0.frame.contains(center) } ?? NSScreen.main
         if let screen {
             origin = TeleportMath.clampOrigin(origin, petSize: size, visibleFrame: screen.visibleFrame)
         }
-        window.setFrame(CGRect(origin: origin, size: size), display: true)
+        let frame = CGRect(origin: origin, size: size)
+        guard isValidWindowFrame(frame) else { return }
+        window.setFrame(frame, display: true)
         contentView.needsDisplay = true
         UserDefaults.standard.set(origin.x, forKey: "petOriginX")
         UserDefaults.standard.set(origin.y, forKey: "petOriginY")
@@ -313,29 +353,31 @@ final class PetWindowController: NSWindowController {
     func restorePetPresentation() {
         setTeleportEffectPadding(0)
         suppressLiveImageForEffect = false
-        freezeFrameForTeleport = false
         contentView.isHidden = false
         contentView.alphaValue = 1
         contentView.layer?.removeAllAnimations()
         contentView.layer?.opacity = 1
         contentView.layer?.transform = CATransform3DIdentity
         contentView.layer?.mask = nil
-        refreshFrame()
+        if !endTeleportGeometryFreeze() {
+            refreshFrame()
+        }
     }
 
     /// Grow the transparent window so rings / dust aren't clipped.
     func setTeleportEffectPadding(_ padding: CGFloat) {
-        guard let window else { return }
+        guard let window, padding.isFinite, effectPadding.isFinite else { return }
         let padding = max(0, padding)
         guard abs(padding - effectPadding) > 0.5 else { return }
         let old = effectPadding
-        effectPadding = padding
         var frame = window.frame
         // Keep visual center stable when padding changes.
         frame.origin.x -= (padding - old)
         frame.origin.y -= (padding - old)
         frame.size.width += (padding - old) * 2
         frame.size.height += (padding - old) * 2
+        guard isValidWindowFrame(frame) else { return }
+        effectPadding = padding
         window.setFrame(frame, display: true)
         contentView.needsDisplay = true
     }
@@ -355,6 +397,27 @@ final class PetWindowController: NSWindowController {
         }
 
         let index = engine.currentFrameIndex
+        let displaySize = effectiveDisplaySize(for: clip)
+        let paddedSize = CGSize(
+            width: displaySize.width + effectPadding * 2,
+            height: displaySize.height + effectPadding * 2
+        )
+        guard PetClipPresentationPolicy.isValidDisplaySize(displaySize),
+              PetClipPresentationPolicy.isValidDisplaySize(paddedSize),
+              let geometryFrame = resolvedGeometryFrame(window: window, paddedSize: paddedSize) else {
+            handleUnrenderableFrame(clipID: id, frameIndex: index)
+            return
+        }
+        petDisplaySize = displaySize
+        contentView.petContentSize = petDisplaySize
+
+        // During a teleport trip the controller owns geometry. A skipped
+        // update is remembered and applied once after the renderer removes
+        // its padding and releases the geometry freeze.
+        if geometryRefreshState.requestRefresh() {
+            window.setFrame(geometryFrame, display: true)
+        }
+
         if let cache = frameCache, cache.clipID == id, cache.index == index {
             contentView.image = suppressLiveImageForEffect ? nil : cache.image
             onFrameRendered?(cache.image)
@@ -362,35 +425,52 @@ final class PetWindowController: NSWindowController {
         }
 
         let url = AppPaths.frameURL(clipID: id, index: index)
-        guard let image = NSImage(contentsOf: url) else {
-            contentView.image = nil
+        guard let image = NSImage(contentsOf: url),
+              image.size.width.isFinite,
+              image.size.height.isFinite,
+              image.size.width > 0,
+              image.size.height > 0,
+              decodedCGImage(from: image) != nil else {
+            handleUnrenderableFrame(clipID: id, frameIndex: index)
             return
         }
         frameCache = (id, index, image)
         contentView.image = suppressLiveImageForEffect ? nil : image
         onFrameRendered?(image)
 
-        let scale = max(0.35, min(store.state.petScale, 3.0))
-        let w = CGFloat(clip.displayWidth) * scale
-        let h = CGFloat(clip.displayHeight) * scale
-        petDisplaySize = NSSize(width: w, height: h)
-        contentView.petContentSize = petDisplaySize
+    }
 
-        // During a teleport trip the controller owns geometry — image and
-        // petContentSize keep updating above, but the window must not move.
-        guard !freezeFrameForTeleport else { return }
-
-        // Anchor at BOTTOM-CENTER when clip crops differ in size: the feet
-        // stay planted and the body grows upward/centered. (Top-left
-        // anchoring made the cat visibly hop whenever the next clip's crop
-        // height differed — most noticeable right after a teleport.)
+    private func resolvedGeometryFrame(window: NSWindow, paddedSize: CGSize) -> CGRect? {
         var frame = window.frame
         let bottom = frame.minY
         let centerX = frame.midX
-        frame.size = NSSize(width: w + effectPadding * 2, height: h + effectPadding * 2)
-        frame.origin.x = centerX - frame.size.width / 2
-        frame.origin.y = bottom
-        window.setFrame(frame, display: true)
+        guard bottom.isFinite, centerX.isFinite else { return nil }
+        frame.size = paddedSize
+        frame.origin = CGPoint(x: centerX - frame.width / 2, y: bottom)
+        if let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame {
+            frame.origin = TeleportMath.clampOrigin(
+                frame.origin,
+                petSize: frame.size,
+                visibleFrame: visibleFrame
+            )
+        }
+        return isValidWindowFrame(frame) ? frame : nil
+    }
+
+    private func isValidWindowFrame(_ frame: CGRect) -> Bool {
+        frame.origin.x.isFinite
+            && frame.origin.y.isFinite
+            && PetClipPresentationPolicy.isValidDisplaySize(frame.size)
+    }
+
+    private func handleUnrenderableFrame(clipID: String, frameIndex: Int) {
+        contentView.image = nil
+        onFrameLoadFailed?(clipID, frameIndex)
+    }
+
+    private func decodedCGImage(from image: NSImage) -> CGImage? {
+        var proposedRect = NSRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil)
     }
 
     private func restoreOrPositionDefault() {
@@ -430,4 +510,8 @@ extension Notification.Name {
     static let libraryDidChange = Notification.Name("DesktopPet.libraryDidChange")
     static let playbackDidChange = Notification.Name("DesktopPet.playbackDidChange")
     static let petPositionDidChange = Notification.Name("DesktopPet.petPositionDidChange")
+    static let petPresentationDidChange = Notification.Name("DesktopPet.petPresentationDidChange")
+    static let idlePresentationSettingsDidChange = Notification.Name(
+        "DesktopPet.idlePresentationSettingsDidChange"
+    )
 }

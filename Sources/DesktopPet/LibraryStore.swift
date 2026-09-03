@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import DesktopPetCore
 
 enum AppPaths {
     static var supportRoot: URL {
@@ -110,18 +111,30 @@ final class LibraryStore {
         if changed { save() }
     }
 
-    func save() {
+    @discardableResult
+    func save() -> String? {
         do {
             let data = try encoder.encode(state)
             try data.write(to: AppPaths.libraryURL, options: .atomic)
+            return nil
         } catch {
-            lastError = "保存失败: \(error.localizedDescription)"
+            let saveError = "保存失败: \(error.localizedDescription)"
+            if lastError == nil {
+                lastError = saveError
+            }
+            return saveError
         }
     }
 
-    func update(_ mutate: (inout LibraryState) -> Void) {
+    @discardableResult
+    func update(_ mutate: (inout LibraryState) -> Void) -> String? {
         mutate(&state)
-        save()
+        return save()
+    }
+
+    func consumeLastError(ifMatching error: String) {
+        guard lastError == error else { return }
+        lastError = nil
     }
 
     func clip(id: String) -> PetClip? {
@@ -212,6 +225,34 @@ final class LibraryStore {
         return newSelection
     }
 
+    /// Reorder one filtered library tab while leaving the other tab's slots fixed.
+    @discardableResult
+    func moveVisibleClips(
+        ids: [String],
+        selectedIDs: [String],
+        direction: ClipMoveDirection
+    ) -> [String] {
+        let result = PetClipPresentationPolicy.moveVisibleIDs(
+            ids,
+            selectedIDs: selectedIDs,
+            direction: direction
+        )
+        update { state in
+            let clipsByID = Dictionary(uniqueKeysWithValues: state.clips.map { ($0.id, $0) })
+            let orderedIDs = PetClipPresentationPolicy.replacingVisibleOrder(
+                in: state.clips.map(\.id),
+                visibleIDs: ids,
+                reorderedVisibleIDs: result.orderedIDs
+            )
+            state.clips = orderedIDs.compactMap { clipsByID[$0] }
+            if !state.activeQueue.isEmpty {
+                let queued = Set(state.activeQueue)
+                state.activeQueue = state.clips.map(\.id).filter(queued.contains)
+            }
+        }
+        return result.selectedIDs
+    }
+
     /// Copy source into app support and probe duration — does not key yet.
     func prepareStaging(from sourceURL: URL, displayName: String? = nil) throws -> ImportStaging {
         lastError = nil
@@ -262,7 +303,11 @@ final class LibraryStore {
     }
 
     /// Full chromakey export after user accepted preview settings.
-    func commitImport(staging: ImportStaging, settings: ChromaKeySettings) async -> PetClip? {
+    func commitImport(
+        staging: ImportStaging,
+        settings: ChromaKeySettings,
+        materialType: ClipImportMaterialType = .cat
+    ) async -> PetClip? {
         lastError = nil
         importProgress = ImportProgress(
             clipName: staging.displayName,
@@ -280,6 +325,13 @@ final class LibraryStore {
                 )
             }.value
             clip.name = staging.displayName
+            if materialType.isCursorPrey {
+                clip.tags.removeAll { $0 == ClipTag.cursorInteraction }
+                if !clip.tags.contains(ClipTag.cursorPrey) {
+                    clip.tags.append(ClipTag.cursorPrey)
+                }
+                clip.cursorPreySettings = CursorPreySettings()
+            }
 
             update { s in
                 s.clips.append(clip)
@@ -305,6 +357,51 @@ final class LibraryStore {
             } else {
                 s.clips[idx].tags.append(tag)
             }
+        }
+    }
+
+    /// Assign or remove the cursor-prey role. The two cursor-interaction roles
+    /// are mutually exclusive, while a removed prey role retains its settings.
+    func setCursorPreyEnabled(clipID: String, enabled: Bool) {
+        update { s in
+            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
+            s.clips[idx].tags.removeAll { $0 == ClipTag.cursorPrey }
+            if enabled {
+                s.clips[idx].tags.removeAll { $0 == ClipTag.cursorInteraction }
+                s.clips[idx].tags.append(ClipTag.cursorPrey)
+                if s.clips[idx].cursorPreySettings == nil {
+                    s.clips[idx].cursorPreySettings = CursorPreySettings()
+                }
+            }
+            rebuildAutoLinksIfNeeded(in: &s)
+        }
+    }
+
+    /// Assign or remove the one-shot cursor-interaction cat role.
+    func setCursorInteractionEnabled(clipID: String, enabled: Bool) {
+        update { s in
+            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
+            s.clips[idx].tags.removeAll { $0 == ClipTag.cursorInteraction }
+            if enabled {
+                s.clips[idx].tags.removeAll { $0 == ClipTag.cursorPrey }
+                s.clips[idx].tags.append(ClipTag.cursorInteraction)
+            }
+            rebuildAutoLinksIfNeeded(in: &s)
+        }
+    }
+
+    /// Persist the display size for one prey material, clamped to its supported range.
+    func setCursorPreyDisplaySize(clipID: String, displaySize: Double) {
+        update { s in
+            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
+            s.clips[idx].cursorPreySettings = CursorPreySettings(displaySize: displaySize)
+        }
+    }
+
+    func setClipScale(clipID: String, scale: Double) {
+        update { state in
+            guard let index = state.clips.firstIndex(where: { $0.id == clipID }) else { return }
+            state.clips[index].clipScale = PetClipPresentationPolicy.clampedClipScale(scale)
         }
     }
 
@@ -356,5 +453,10 @@ final class LibraryStore {
             linkCount = TransitionMatcher.rebuildAutoLinks(in: &s)
         }
         return linkCount
+    }
+
+    private func rebuildAutoLinksIfNeeded(in state: inout LibraryState) {
+        guard state.autoLinkEnabled else { return }
+        TransitionMatcher.rebuildAutoLinks(in: &state)
     }
 }

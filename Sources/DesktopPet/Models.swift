@@ -21,6 +21,40 @@ enum PlaybackMode: String, Codable, CaseIterable, Identifiable {
 enum ClipTag {
     /// Played when the user taps/pets the cat.
     static let petting = "petting"
+    /// Animated target displayed at the real cursor during a cursor interaction.
+    static let cursorPrey = "cursorPrey"
+    /// One-shot cat action played during a cursor interaction.
+    static let cursorInteraction = "cursorInteraction"
+}
+
+struct CursorPreySettings: Codable, Equatable, Hashable {
+    var displaySize: Double {
+        didSet {
+            displaySize = CursorInteractionPolicy.clampedPreyDisplaySize(displaySize)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case displaySize
+    }
+
+    init(displaySize: Double = CursorInteractionPolicy.defaultPreyDisplaySize) {
+        self.displaySize = CursorInteractionPolicy.clampedPreyDisplaySize(displaySize)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let displaySize = try container.decode(Double.self, forKey: .displaySize)
+        self.init(displaySize: displaySize)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(
+            CursorInteractionPolicy.clampedPreyDisplaySize(displaySize),
+            forKey: .displaySize
+        )
+    }
 }
 
 struct PetClip: Codable, Identifiable, Equatable, Hashable {
@@ -40,8 +74,33 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
     var playCount: Int
     /// Behaviour tags (see ClipTag).
     var tags: [String]
+    /// Per-material display configuration for a cursor prey clip.
+    var cursorPreySettings: CursorPreySettings?
+    /// Per-clip scale for cat materials. Cursor prey ignores this value.
+    var clipScale: Double
 
     var framesDirectoryName: String { id }
+
+    var isCursorInteractionMaterial: Bool {
+        tags.contains(ClipTag.cursorPrey) || tags.contains(ClipTag.cursorInteraction)
+    }
+
+    var libraryTab: ClipLibraryTab {
+        tags.contains(ClipTag.cursorPrey) ? .cursorTargets : .cats
+    }
+
+    func effectiveDisplaySize(
+        globalScale: Double,
+        presentationMultiplier: Double = 1
+    ) -> CGSize {
+        PetClipPresentationPolicy.displaySize(
+            width: displayWidth,
+            height: displayHeight,
+            clipScale: clipScale,
+            globalScale: globalScale,
+            presentationMultiplier: presentationMultiplier
+        )
+    }
 
     var duration: TimeInterval {
         guard fps > 0 else { return 0 }
@@ -82,7 +141,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
     enum CodingKeys: String, CodingKey {
         case id, name, sourcePath, frameCount, fps, displayWidth, displayHeight
         case firstFingerprint, lastFingerprint, nextClipIDs, createdAt, playCount
-        case tags
+        case tags, cursorPreySettings, clipScale
     }
 
     init(
@@ -98,7 +157,9 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
         nextClipIDs: [String],
         createdAt: Date,
         playCount: Int = 0,
-        tags: [String] = []
+        tags: [String] = [],
+        cursorPreySettings: CursorPreySettings? = nil,
+        clipScale: Double = PetClipPresentationPolicy.defaultClipScale
     ) {
         self.id = id
         self.name = name
@@ -113,6 +174,8 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
         self.createdAt = createdAt
         self.playCount = playCount
         self.tags = tags
+        self.cursorPreySettings = cursorPreySettings
+        self.clipScale = PetClipPresentationPolicy.clampedClipScale(clipScale)
     }
 
     init(from decoder: Decoder) throws {
@@ -130,6 +193,10 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         playCount = try c.decodeIfPresent(Int.self, forKey: .playCount) ?? 0
         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
+        cursorPreySettings = try c.decodeIfPresent(CursorPreySettings.self, forKey: .cursorPreySettings)
+        clipScale = PetClipPresentationPolicy.resolvedClipScale(
+            try c.decodeIfPresent(Double.self, forKey: .clipScale)
+        )
     }
 }
 
@@ -139,6 +206,13 @@ struct LibraryState: Codable {
     var petScale: Double
     var alwaysOnTop: Bool
     var clickThrough: Bool
+    var preventIdleDisplaySleep: Bool
+    private var manicIdleDelayStorage: PersistedIdleDelay
+    var manicIdleDelay: TimeInterval? {
+        get { manicIdleDelayStorage.value }
+        set { manicIdleDelayStorage = PersistedIdleDelay(value: newValue) }
+    }
+    var manicScale: Double
     /// Similarity threshold 0...1 for auto transition edges.
     var autoLinkThreshold: Double
     var autoLinkEnabled: Bool
@@ -155,6 +229,9 @@ struct LibraryState: Codable {
         petScale: 1.0,
         alwaysOnTop: true,
         clickThrough: false,
+        preventIdleDisplaySleep: false,
+        manicIdleDelay: IdlePresentationPolicy.defaultIdleDelay,
+        manicScale: IdlePresentationPolicy.defaultManicScale,
         autoLinkThreshold: 0.82,
         autoLinkEnabled: true,
         activeQueue: [],
@@ -166,12 +243,18 @@ struct LibraryState: Codable {
 
     /// Clips participating in the current play cycle.
     var playableClips: [PetClip] {
-        if activeQueue.isEmpty { return clips }
-        return activeQueue.compactMap { id in clips.first { $0.id == id } }
+        let ordinaryClips = clips.filter { !$0.isCursorInteractionMaterial }
+        if activeQueue.isEmpty { return ordinaryClips }
+        return activeQueue.compactMap { id in
+            ordinaryClips.first { $0.id == id }
+        }
     }
 
     enum CodingKeys: String, CodingKey {
         case clips, playbackMode, petScale, alwaysOnTop, clickThrough
+        case preventIdleDisplaySleep
+        case manicIdleDelayStorage = "manicIdleDelay"
+        case manicScale
         case autoLinkThreshold, autoLinkEnabled, activeQueue
         case teleportEnabled, teleportFrequency, cursorNudgeEnabled, reminderMessages
     }
@@ -182,6 +265,9 @@ struct LibraryState: Codable {
         petScale: Double,
         alwaysOnTop: Bool,
         clickThrough: Bool,
+        preventIdleDisplaySleep: Bool,
+        manicIdleDelay: TimeInterval?,
+        manicScale: Double,
         autoLinkThreshold: Double,
         autoLinkEnabled: Bool,
         activeQueue: [String],
@@ -195,6 +281,9 @@ struct LibraryState: Codable {
         self.petScale = petScale
         self.alwaysOnTop = alwaysOnTop
         self.clickThrough = clickThrough
+        self.preventIdleDisplaySleep = preventIdleDisplaySleep
+        self.manicIdleDelayStorage = PersistedIdleDelay(value: manicIdleDelay)
+        self.manicScale = IdlePresentationPolicy.resolvedManicScale(manicScale)
         self.autoLinkThreshold = autoLinkThreshold
         self.autoLinkEnabled = autoLinkEnabled
         self.activeQueue = activeQueue
@@ -211,6 +300,21 @@ struct LibraryState: Codable {
         petScale = try c.decode(Double.self, forKey: .petScale)
         alwaysOnTop = try c.decode(Bool.self, forKey: .alwaysOnTop)
         clickThrough = try c.decode(Bool.self, forKey: .clickThrough)
+        preventIdleDisplaySleep = try c.decodeIfPresent(Bool.self, forKey: .preventIdleDisplaySleep)
+            ?? false
+        let manicIdleDelayKeyWasPresent = c.contains(.manicIdleDelayStorage)
+        let storedManicIdleDelay = manicIdleDelayKeyWasPresent
+            ? try c.decode(PersistedIdleDelay.self, forKey: .manicIdleDelayStorage).value
+            : nil
+        manicIdleDelayStorage = PersistedIdleDelay(
+            value: IdlePresentationPolicy.resolvedIdleDelay(
+                storedValue: storedManicIdleDelay,
+                keyWasPresent: manicIdleDelayKeyWasPresent
+            )
+        )
+        manicScale = IdlePresentationPolicy.resolvedManicScale(
+            try c.decodeIfPresent(Double.self, forKey: .manicScale)
+        )
         autoLinkThreshold = try c.decode(Double.self, forKey: .autoLinkThreshold)
         autoLinkEnabled = try c.decode(Bool.self, forKey: .autoLinkEnabled)
         activeQueue = try c.decodeIfPresent([String].self, forKey: .activeQueue) ?? []

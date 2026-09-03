@@ -1,0 +1,105 @@
+# Review package: adedcf4..c15e543
+
+## Commits
+c15e543 [展示] 新增空闲魔性阶段策略
+
+## Files changed
+ .../DesktopPetCore/IdlePresentationPolicy.swift    | 43 ++++++++++++++++++++++
+ .../IdlePresentationPolicyTests.swift              | 39 ++++++++++++++++++++
+ 2 files changed, 82 insertions(+)
+
+## Diff
+diff --git a/Sources/DesktopPetCore/IdlePresentationPolicy.swift b/Sources/DesktopPetCore/IdlePresentationPolicy.swift
+new file mode 100644
+index 0000000..e5f3855
+--- /dev/null
++++ b/Sources/DesktopPetCore/IdlePresentationPolicy.swift
+@@ -0,0 +1,43 @@
++import Foundation
++
++public enum IdlePresentationPhase: Equatable, Sendable {
++    case normal
++    case manic
++}
++
++public enum IdlePresentationPolicy {
++    public static let supportedIdleDelays: [TimeInterval] = [60, 180, 300, 600, 900, 1800]
++    public static let defaultIdleDelay: TimeInterval = 300
++    public static let minimumManicScale = 1.0
++    public static let maximumManicScale = 3.0
++    public static let defaultManicScale = 2.0
++
++    public static func resolvedIdleDelay(
++        storedValue: TimeInterval?,
++        keyWasPresent: Bool
++    ) -> TimeInterval? {
++        guard keyWasPresent else { return defaultIdleDelay }
++        guard let storedValue else { return nil }
++        return supportedIdleDelays.contains(storedValue) ? storedValue : defaultIdleDelay
++    }
++
++    public static func clampedManicScale(_ scale: Double) -> Double {
++        guard scale.isFinite else { return defaultManicScale }
++        return min(maximumManicScale, max(minimumManicScale, scale))
++    }
++
++    public static func phase(
++        idleSeconds: TimeInterval,
++        delay: TimeInterval?
++    ) -> IdlePresentationPhase {
++        guard idleSeconds.isFinite, idleSeconds >= 0, let delay else { return .normal }
++        return idleSeconds >= delay ? .manic : .normal
++    }
++
++    public static func presentationMultiplier(
++        manicScale: Double,
++        phase: IdlePresentationPhase
++    ) -> Double {
++        phase == .manic ? clampedManicScale(manicScale) : 1
++    }
++}
+diff --git a/Tests/DesktopPetTests/IdlePresentationPolicyTests.swift b/Tests/DesktopPetTests/IdlePresentationPolicyTests.swift
+new file mode 100644
+index 0000000..86ee125
+--- /dev/null
++++ b/Tests/DesktopPetTests/IdlePresentationPolicyTests.swift
+@@ -0,0 +1,39 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class IdlePresentationPolicyTests: XCTestCase {
++    func testSupportedDelaysAndLegacyDefaultAreExact() {
++        XCTAssertEqual(IdlePresentationPolicy.supportedIdleDelays, [60, 180, 300, 600, 900, 1800])
++        XCTAssertEqual(
++            IdlePresentationPolicy.resolvedIdleDelay(storedValue: nil, keyWasPresent: false),
++            300
++        )
++        XCTAssertNil(IdlePresentationPolicy.resolvedIdleDelay(storedValue: nil, keyWasPresent: true))
++        XCTAssertEqual(
++            IdlePresentationPolicy.resolvedIdleDelay(storedValue: 123, keyWasPresent: true),
++            300
++        )
++    }
++
++    func testPhaseUsesThresholdAndTreatsInvalidIdleAsZero() {
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: 299.9, delay: 300), .normal)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: 300, delay: 300), .manic)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: 900, delay: nil), .normal)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: .nan, delay: 300), .normal)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: -1, delay: 300), .normal)
++    }
++
++    func testManicScaleClampsAndProducesPresentationMultiplier() {
++        XCTAssertEqual(IdlePresentationPolicy.clampedManicScale(.nan), 2)
++        XCTAssertEqual(IdlePresentationPolicy.clampedManicScale(0.5), 1)
++        XCTAssertEqual(IdlePresentationPolicy.clampedManicScale(4), 3)
++        XCTAssertEqual(
++            IdlePresentationPolicy.presentationMultiplier(manicScale: 2.5, phase: .normal),
++            1
++        )
++        XCTAssertEqual(
++            IdlePresentationPolicy.presentationMultiplier(manicScale: 2.5, phase: .manic),
++            2.5
++        )
++    }
++}

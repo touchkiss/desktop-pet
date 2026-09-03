@@ -1,0 +1,292 @@
+diff --git a/Sources/DesktopPet/ChromaKeyProcessor.swift b/Sources/DesktopPet/ChromaKeyProcessor.swift
+index 41bb6f2..082775e 100644
+--- a/Sources/DesktopPet/ChromaKeyProcessor.swift
++++ b/Sources/DesktopPet/ChromaKeyProcessor.swift
+@@ -405,7 +405,7 @@ enum TransitionMatcher {
+     /// Rebuild graph edges from fingerprints. Returns total link count written.
+     @discardableResult
+     static func rebuildAutoLinks(in state: inout LibraryState) -> Int {
+-        let clips = state.clips
++        let clips = state.clips.filter { !$0.isCursorInteractionMaterial }
+         guard clips.count >= 2 else {
+             for i in state.clips.indices {
+                 state.clips[i].nextClipIDs = []
+@@ -415,8 +415,8 @@ enum TransitionMatcher {
+         let threshold = state.autoLinkThreshold
+         var total = 0
+ 
+-        for i in clips.indices {
+-            let from = clips[i]
++        for i in state.clips.indices where !state.clips[i].isCursorInteractionMaterial {
++            let from = state.clips[i]
+             var scored: [(id: String, score: Double)] = []
+             for other in clips where other.id != from.id {
+                 let score = FrameFingerprint.similarity(from.lastFingerprint, other.firstFingerprint)
+@@ -428,6 +428,9 @@ enum TransitionMatcher {
+             state.clips[i].nextClipIDs = scored.map(\.id)
+             total += scored.count
+         }
++        for i in state.clips.indices where state.clips[i].isCursorInteractionMaterial {
++            state.clips[i].nextClipIDs = []
++        }
+         return total
+     }
+ 
+diff --git a/Sources/DesktopPet/LibraryStore.swift b/Sources/DesktopPet/LibraryStore.swift
+index 51208e7..c503d75 100644
+--- a/Sources/DesktopPet/LibraryStore.swift
++++ b/Sources/DesktopPet/LibraryStore.swift
+@@ -308,6 +308,44 @@ final class LibraryStore {
+         }
+     }
+ 
++    /// Assign or remove the cursor-prey role. The two cursor-interaction roles
++    /// are mutually exclusive, while a removed prey role retains its settings.
++    func setCursorPreyEnabled(clipID: String, enabled: Bool) {
++        update { s in
++            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
++            s.clips[idx].tags.removeAll { $0 == ClipTag.cursorPrey }
++            if enabled {
++                s.clips[idx].tags.removeAll { $0 == ClipTag.cursorInteraction }
++                s.clips[idx].tags.append(ClipTag.cursorPrey)
++                if s.clips[idx].cursorPreySettings == nil {
++                    s.clips[idx].cursorPreySettings = CursorPreySettings()
++                }
++            }
++            rebuildAutoLinksIfNeeded(in: &s)
++        }
++    }
++
++    /// Assign or remove the one-shot cursor-interaction cat role.
++    func setCursorInteractionEnabled(clipID: String, enabled: Bool) {
++        update { s in
++            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
++            s.clips[idx].tags.removeAll { $0 == ClipTag.cursorInteraction }
++            if enabled {
++                s.clips[idx].tags.removeAll { $0 == ClipTag.cursorPrey }
++                s.clips[idx].tags.append(ClipTag.cursorInteraction)
++            }
++            rebuildAutoLinksIfNeeded(in: &s)
++        }
++    }
++
++    /// Persist the display size for one prey material, clamped to its supported range.
++    func setCursorPreyDisplaySize(clipID: String, displaySize: Double) {
++        update { s in
++            guard let idx = s.clips.firstIndex(where: { $0.id == clipID }) else { return }
++            s.clips[idx].cursorPreySettings = CursorPreySettings(displaySize: displaySize)
++        }
++    }
++
+     func renameClip(id: String, to newName: String) {
+         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+         guard !trimmed.isEmpty else { return }
+@@ -357,4 +395,9 @@ final class LibraryStore {
+         }
+         return linkCount
+     }
++
++    private func rebuildAutoLinksIfNeeded(in state: inout LibraryState) {
++        guard state.autoLinkEnabled else { return }
++        TransitionMatcher.rebuildAutoLinks(in: &state)
++    }
+ }
+diff --git a/Sources/DesktopPet/Models.swift b/Sources/DesktopPet/Models.swift
+index b38b30b..606a26e 100644
+--- a/Sources/DesktopPet/Models.swift
++++ b/Sources/DesktopPet/Models.swift
+@@ -21,6 +21,40 @@ enum PlaybackMode: String, Codable, CaseIterable, Identifiable {
+ enum ClipTag {
+     /// Played when the user taps/pets the cat.
+     static let petting = "petting"
++    /// Animated target displayed at the real cursor during a cursor interaction.
++    static let cursorPrey = "cursorPrey"
++    /// One-shot cat action played during a cursor interaction.
++    static let cursorInteraction = "cursorInteraction"
++}
++
++struct CursorPreySettings: Codable, Equatable, Hashable {
++    var displaySize: Double {
++        didSet {
++            displaySize = CursorInteractionPolicy.clampedPreyDisplaySize(displaySize)
++        }
++    }
++
++    private enum CodingKeys: String, CodingKey {
++        case displaySize
++    }
++
++    init(displaySize: Double = CursorInteractionPolicy.defaultPreyDisplaySize) {
++        self.displaySize = CursorInteractionPolicy.clampedPreyDisplaySize(displaySize)
++    }
++
++    init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        let displaySize = try container.decode(Double.self, forKey: .displaySize)
++        self.init(displaySize: displaySize)
++    }
++
++    func encode(to encoder: Encoder) throws {
++        var container = encoder.container(keyedBy: CodingKeys.self)
++        try container.encode(
++            CursorInteractionPolicy.clampedPreyDisplaySize(displaySize),
++            forKey: .displaySize
++        )
++    }
+ }
+ 
+ struct PetClip: Codable, Identifiable, Equatable, Hashable {
+@@ -40,9 +74,15 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
+     var playCount: Int
+     /// Behaviour tags (see ClipTag).
+     var tags: [String]
++    /// Per-material display configuration for a cursor prey clip.
++    var cursorPreySettings: CursorPreySettings?
+ 
+     var framesDirectoryName: String { id }
+ 
++    var isCursorInteractionMaterial: Bool {
++        tags.contains(ClipTag.cursorPrey) || tags.contains(ClipTag.cursorInteraction)
++    }
++
+     var duration: TimeInterval {
+         guard fps > 0 else { return 0 }
+         return Double(frameCount) / fps
+@@ -82,7 +122,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
+     enum CodingKeys: String, CodingKey {
+         case id, name, sourcePath, frameCount, fps, displayWidth, displayHeight
+         case firstFingerprint, lastFingerprint, nextClipIDs, createdAt, playCount
+-        case tags
++        case tags, cursorPreySettings
+     }
+ 
+     init(
+@@ -98,7 +138,8 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
+         nextClipIDs: [String],
+         createdAt: Date,
+         playCount: Int = 0,
+-        tags: [String] = []
++        tags: [String] = [],
++        cursorPreySettings: CursorPreySettings? = nil
+     ) {
+         self.id = id
+         self.name = name
+@@ -113,6 +154,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
+         self.createdAt = createdAt
+         self.playCount = playCount
+         self.tags = tags
++        self.cursorPreySettings = cursorPreySettings
+     }
+ 
+     init(from decoder: Decoder) throws {
+@@ -130,6 +172,7 @@ struct PetClip: Codable, Identifiable, Equatable, Hashable {
+         createdAt = try c.decode(Date.self, forKey: .createdAt)
+         playCount = try c.decodeIfPresent(Int.self, forKey: .playCount) ?? 0
+         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
++        cursorPreySettings = try c.decodeIfPresent(CursorPreySettings.self, forKey: .cursorPreySettings)
+     }
+ }
+ 
+@@ -166,8 +209,11 @@ struct LibraryState: Codable {
+ 
+     /// Clips participating in the current play cycle.
+     var playableClips: [PetClip] {
+-        if activeQueue.isEmpty { return clips }
+-        return activeQueue.compactMap { id in clips.first { $0.id == id } }
++        let ordinaryClips = clips.filter { !$0.isCursorInteractionMaterial }
++        if activeQueue.isEmpty { return ordinaryClips }
++        return activeQueue.compactMap { id in
++            ordinaryClips.first { $0.id == id }
++        }
+     }
+ 
+     enum CodingKeys: String, CodingKey {
+diff --git a/Sources/DesktopPetCore/CursorInteractionPolicy.swift b/Sources/DesktopPetCore/CursorInteractionPolicy.swift
+new file mode 100644
+index 0000000..cd75a8d
+--- /dev/null
++++ b/Sources/DesktopPetCore/CursorInteractionPolicy.swift
+@@ -0,0 +1,23 @@
++import Foundation
++
++public enum CursorInteractionPolicy {
++    public static let minimumPreyDisplaySize = 16.0
++    public static let maximumPreyDisplaySize = 128.0
++    public static let defaultPreyDisplaySize = 48.0
++
++    public static func clampedPreyDisplaySize(_ size: Double) -> Double {
++        min(max(size, minimumPreyDisplaySize), maximumPreyDisplaySize)
++    }
++
++    public static func isInteractionEligible(
++        isAutonomous: Bool,
++        landingMode: TeleportLandingMode,
++        hasPreyCandidate: Bool,
++        hasInteractionCandidate: Bool
++    ) -> Bool {
++        isAutonomous
++            && landingMode == .cursorNudge
++            && hasPreyCandidate
++            && hasInteractionCandidate
++    }
++}
+diff --git a/Tests/DesktopPetTests/CursorInteractionPolicyTests.swift b/Tests/DesktopPetTests/CursorInteractionPolicyTests.swift
+new file mode 100644
+index 0000000..c0f8fe4
+--- /dev/null
++++ b/Tests/DesktopPetTests/CursorInteractionPolicyTests.swift
+@@ -0,0 +1,53 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class CursorInteractionPolicyTests: XCTestCase {
++    func testPreySizeBoundsAreInclusive() {
++        XCTAssertEqual(CursorInteractionPolicy.minimumPreyDisplaySize, 16)
++        XCTAssertEqual(CursorInteractionPolicy.maximumPreyDisplaySize, 128)
++        XCTAssertEqual(CursorInteractionPolicy.clampedPreyDisplaySize(16), 16)
++        XCTAssertEqual(CursorInteractionPolicy.clampedPreyDisplaySize(128), 128)
++    }
++
++    func testPreySizeIsClampedToSupportedRange() {
++        XCTAssertEqual(CursorInteractionPolicy.clampedPreyDisplaySize(-10), 16)
++        XCTAssertEqual(CursorInteractionPolicy.clampedPreyDisplaySize(200), 128)
++    }
++
++    func testDefaultPreySizeIs48Points() {
++        XCTAssertEqual(CursorInteractionPolicy.defaultPreyDisplaySize, 48)
++    }
++
++    func testInteractionRequiresAutonomousCursorNudgeAndBothCandidates() {
++        XCTAssertTrue(CursorInteractionPolicy.isInteractionEligible(
++            isAutonomous: true,
++            landingMode: .cursorNudge,
++            hasPreyCandidate: true,
++            hasInteractionCandidate: true
++        ))
++        XCTAssertFalse(CursorInteractionPolicy.isInteractionEligible(
++            isAutonomous: false,
++            landingMode: .cursorNudge,
++            hasPreyCandidate: true,
++            hasInteractionCandidate: true
++        ))
++        XCTAssertFalse(CursorInteractionPolicy.isInteractionEligible(
++            isAutonomous: true,
++            landingMode: .corner,
++            hasPreyCandidate: true,
++            hasInteractionCandidate: true
++        ))
++        XCTAssertFalse(CursorInteractionPolicy.isInteractionEligible(
++            isAutonomous: true,
++            landingMode: .cursorNudge,
++            hasPreyCandidate: false,
++            hasInteractionCandidate: true
++        ))
++        XCTAssertFalse(CursorInteractionPolicy.isInteractionEligible(
++            isAutonomous: true,
++            landingMode: .cursorNudge,
++            hasPreyCandidate: true,
++            hasInteractionCandidate: false
++        ))
++    }
++}
+

@@ -1,0 +1,575 @@
+diff --git a/Sources/DesktopPet/AppDelegate.swift b/Sources/DesktopPet/AppDelegate.swift
+index 4253bcd..925ec57 100644
+--- a/Sources/DesktopPet/AppDelegate.swift
++++ b/Sources/DesktopPet/AppDelegate.swift
+@@ -135,10 +135,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         teleportController?.syncFromStore()
+         petWindow?.applyWindowFlags()
+         if engine.currentClipID == nil, let id = store.state.playableClips.first?.id {
+-            engine.playClip(id: id)
+-        } else if let id = engine.currentClipID, store.clip(id: id) == nil {
++            engine.playClip(id: id, notifyingObservers: false)
++        } else if let id = engine.currentClipID,
++                  store.clip(id: id)?.isCursorInteractionMaterial != false {
+             if let next = store.state.playableClips.first?.id {
+-                engine.playClip(id: next)
++                engine.playClip(id: next, notifyingObservers: false)
+             } else {
+                 engine.stop()
+                 petWindow?.refreshFrame()
+@@ -147,7 +148,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+             engine.restartTimer()
+             petWindow?.refreshFrame()
+         }
+-        libraryWindow?.reload(preservingSelection: true)
+     }
+ 
+     private func syncPetFrame() {
+@@ -262,14 +262,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+ 
+     @objc func openLibrary() {
+         if let libraryWindow {
+-            libraryWindow.reload()
+             libraryWindow.showWindow(nil)
++            libraryWindow.reload()
+             NSApp.activate(ignoringOtherApps: true)
+             return
+         }
+         let wc = LibraryWindowController(store: store, engine: engine)
+         libraryWindow = wc
+         wc.showWindow(nil)
++        wc.reload()
+         wc.window?.center()
+         NSApp.activate(ignoringOtherApps: true)
+     }
+diff --git a/Sources/DesktopPet/LibraryWindowController.swift b/Sources/DesktopPet/LibraryWindowController.swift
+index cbf70f6..b8f2f57 100644
+--- a/Sources/DesktopPet/LibraryWindowController.swift
++++ b/Sources/DesktopPet/LibraryWindowController.swift
+@@ -1,9 +1,10 @@
+ import AppKit
++import DesktopPetCore
+ import ImageIO
+ import UniformTypeIdentifiers
+ 
+ @MainActor
+-final class LibraryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
++final class LibraryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+     private let store: LibraryStore
+     private let engine: PlaylistEngine
+ 
+@@ -39,6 +40,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+         window.isReleasedWhenClosed = false
+         window.minSize = NSSize(width: 760, height: 520)
+         super.init(window: window)
++        window.delegate = self
+ 
+         buildUI()
+         reload()
+@@ -61,6 +63,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+     @available(*, unavailable)
+     required init?(coder: NSCoder) { fatalError() }
+ 
++    func windowWillClose(_ notification: Notification) {
++        detail.stopPreviews()
++    }
++
+     private func buildUI() {
+         guard let content = window?.contentView else { return }
+ 
+@@ -262,6 +268,15 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+             self.store.toggleTag(clipID: clipID, tag: tag)
+             NotificationCenter.default.post(name: .libraryDidChange, object: nil)
+         }
++        detail.onToggleCursorPrey = { [weak self] clipID, enabled in
++            self?.updateCursorInteractionRole(clipID: clipID, isPrey: true, enabled: enabled)
++        }
++        detail.onToggleCursorInteraction = { [weak self] clipID, enabled in
++            self?.updateCursorInteractionRole(clipID: clipID, isPrey: false, enabled: enabled)
++        }
++        detail.onCursorPreyDisplaySizeChanged = { [weak self] clipID, displaySize in
++            self?.store.setCursorPreyDisplaySize(clipID: clipID, displaySize: displaySize)
++        }
+ 
+         body.addSubview(listPane)
+         body.addSubview(divider)
+@@ -415,8 +430,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+ 
+         let count = store.state.clips.count
+         let selectedCount = table.numberOfSelectedRows
+-        let queueCount = store.state.activeQueue.count
+-        let queueText = queueCount > 0 ? " · 队列 \(queueCount)" : ""
++        let activeQueue = filteredActiveQueueIDs()
++        let hasActiveQueue = !store.state.activeQueue.isEmpty
++        let queueCount = activeQueue.count
++        let queueText = hasActiveQueue ? " · 队列 \(queueCount)" : ""
+         countLabel.stringValue = "已选 \(max(selectedCount, selectedIDs.count)) / 共 \(count)\(queueText)"
+         window?.title = "桌面宠物 · 片段库（\(count)）"
+ 
+@@ -465,8 +482,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+     private func updateCountLabel() {
+         let count = store.state.clips.count
+         let selectedCount = table.selectedRowIndexes.count
+-        let queueCount = store.state.activeQueue.count
+-        let queueText = queueCount > 0 ? " · 队列 \(queueCount)" : " · 播放全部"
++        let activeQueue = filteredActiveQueueIDs()
++        let hasActiveQueue = !store.state.activeQueue.isEmpty
++        let queueCount = activeQueue.count
++        let queueText = hasActiveQueue ? " · 队列 \(queueCount)" : " · 播放全部"
+         countLabel.stringValue = "已选 \(selectedCount) / 共 \(count)\(queueText)"
+         countLabel.textColor = .secondaryLabelColor
+     }
+@@ -508,14 +527,37 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+     }
+ 
+     private func showSelectedDetail() {
++        guard window?.isVisible == true else {
++            detail.stopPreviews()
++            return
++        }
+         let selected = selectedClips()
+         if selected.count > 1 {
+-            detail.showMultiple(selected: selected, queue: store.state.activeQueue)
++            detail.showMultiple(selected: selected, queue: filteredActiveQueueIDs())
+         } else {
+             detail.show(clip: selected.first, all: store.state.clips, threshold: store.state.autoLinkThreshold)
+         }
+     }
+ 
++    private func filteredActiveQueueIDs() -> [String] {
++        guard !store.state.activeQueue.isEmpty else { return [] }
++        return store.state.activeQueue.filter { id in
++            store.clip(id: id)?.isCursorInteractionMaterial == false
++        }
++    }
++
++    private func updateCursorInteractionRole(clipID: String, isPrey: Bool, enabled: Bool) {
++        if isPrey {
++            store.setCursorPreyEnabled(clipID: clipID, enabled: enabled)
++        } else {
++            store.setCursorInteractionEnabled(clipID: clipID, enabled: enabled)
++        }
++
++        // App-wide library synchronization corrects the playback target and
++        // refreshes the list/detail exactly once for this role mutation.
++        NotificationCenter.default.post(name: .libraryDidChange, object: nil)
++    }
++
+     // MARK: Actions
+ 
+     @objc private func selectAllClips() {
+@@ -855,7 +897,15 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+ 
+         let title = clip.displayTitle(indexInLibrary: row)
+         let playing = engine.currentClipID == clip.id
+-        let queueIndex = store.state.activeQueue.firstIndex(of: clip.id).map { $0 + 1 }
++        let queueIndex = filteredActiveQueueIDs().firstIndex(of: clip.id).map { $0 + 1 }
++        let interactionRole: String?
++        if clip.tags.contains(ClipTag.cursorPrey) {
++            interactionRole = "互动目标 · 不参与普通播放"
++        } else if clip.tags.contains(ClipTag.cursorInteraction) {
++            interactionRole = "互动猫片段 · 不参与普通播放"
++        } else {
++            interactionRole = nil
++        }
+         cell.configure(
+             title: title,
+             meta: clip.metaText,
+@@ -863,6 +913,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource,
+             firstFrame: AppPaths.frameURL(clipID: clip.id, index: 1),
+             lastFrame: AppPaths.frameURL(clipID: clip.id, index: max(1, clip.frameCount)),
+             queueIndex: queueIndex,
++            interactionRole: interactionRole,
+             isPlaying: playing
+         )
+         cell.toolTip = "\(title)\n导入：\(clip.importedAtText)\n\(clip.frameCount) 帧 · \(String(format: "%.1f", clip.duration)) 秒\n播放 \(clip.playCount) 次"
+@@ -973,6 +1024,7 @@ final class ClipTableCellView: NSTableCellView {
+         firstFrame: URL,
+         lastFrame: URL,
+         queueIndex: Int?,
++        interactionRole: String?,
+         isPlaying: Bool
+     ) {
+         titleLabel.stringValue = title + (isPlaying ? "  ▶" : "")
+@@ -981,8 +1033,12 @@ final class ClipTableCellView: NSTableCellView {
+         firstThumb.image = ThumbnailCache.shared.image(at: firstFrame)
+         lastThumb.image = ThumbnailCache.shared.image(at: lastFrame)
+ 
+-        if let queueIndex {
+-            badgeLabel.stringValue = "队列 #\(queueIndex)"
++        let badges = [
++            queueIndex.map { "队列 #\($0)" },
++            interactionRole
++        ].compactMap { $0 }
++        if !badges.isEmpty {
++            badgeLabel.stringValue = badges.joined(separator: " · ")
+             badgeLabel.isHidden = false
+         } else {
+             badgeLabel.stringValue = ""
+@@ -1038,11 +1094,15 @@ final class DetailPanel: NSView {
+     var onToggleNext: ((String, String, Bool) -> Void)?
+     var onRename: ((String, String) -> Void)?
+     var onToggleTag: ((String, String) -> Void)?
++    var onToggleCursorPrey: ((String, Bool) -> Void)?
++    var onToggleCursorInteraction: ((String, Bool) -> Void)?
++    var onCursorPreyDisplaySizeChanged: ((String, Double) -> Void)?
+ 
+     private let scroll = NSScrollView()
+     private let stack = NSStackView()
+     private let documentView = FlippedClipView()
+     private let preview = ClipPreviewPlayer()
++    private let cursorPreyPreview = CursorPreyPreview()
+     private var clipID: String?
+     private var shownClipID: String?
+ 
+@@ -1142,8 +1202,13 @@ final class DetailPanel: NSView {
+         }
+     }
+ 
+-    private func clearStack() {
++    func stopPreviews() {
+         preview.stop()
++        cursorPreyPreview.stop()
++    }
++
++    private func clearStack() {
++        stopPreviews()
+         stack.arrangedSubviews.forEach {
+             stack.removeArrangedSubview($0)
+             $0.removeFromSuperview()
+@@ -1187,9 +1252,40 @@ final class DetailPanel: NSView {
+         pettingToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
+         stack.addArrangedSubview(pettingToggle)
+ 
+-        // Full-motion preview of the keyed frame sequence.
+-        stack.addArrangedSubview(preview)
+-        preview.load(clip: clip)
++        let cursorPreyToggle = NSButton(
++            checkboxWithTitle: "鼠标互动目标素材",
++            target: self,
++            action: #selector(toggleCursorPrey(_:))
++        )
++        cursorPreyToggle.state = clip.tags.contains(ClipTag.cursorPrey) ? .on : .off
++        cursorPreyToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
++        stack.addArrangedSubview(cursorPreyToggle)
++
++        let cursorInteractionToggle = NSButton(
++            checkboxWithTitle: "鼠标互动猫片段",
++            target: self,
++            action: #selector(toggleCursorInteraction(_:))
++        )
++        cursorInteractionToggle.state = clip.tags.contains(ClipTag.cursorInteraction) ? .on : .off
++        cursorInteractionToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
++        stack.addArrangedSubview(cursorInteractionToggle)
++
++        let cursorInteractionHint = NSTextField(wrappingLabelWithString: "两类鼠标互动专用素材都不会参与普通播放、播放队列或自动衔接；两种角色互斥。")
++        cursorInteractionHint.textColor = .secondaryLabelColor
++        cursorInteractionHint.font = .systemFont(ofSize: 11)
++        cursorInteractionHint.preferredMaxLayoutWidth = 420
++        stack.addArrangedSubview(cursorInteractionHint)
++
++        if clip.tags.contains(ClipTag.cursorPrey) {
++            appendCursorPreyEditor(clip: clip)
++        }
++
++        // Ordinary clips retain the existing full-motion preview. Prey clips
++        // use the focused point-size preview added above instead.
++        if !clip.tags.contains(ClipTag.cursorPrey) {
++            stack.addArrangedSubview(preview)
++            preview.load(clip: clip)
++        }
+ 
+         let frames = NSStackView()
+         frames.orientation = .horizontal
+@@ -1199,6 +1295,8 @@ final class DetailPanel: NSView {
+         frames.addArrangedSubview(frameThumb(url: AppPaths.frameURL(clipID: clip.id, index: max(1, clip.frameCount)), caption: "尾帧"))
+         stack.addArrangedSubview(frames)
+ 
++        guard !clip.isCursorInteractionMaterial else { return }
++
+         let section = NSTextField(labelWithString: "可衔接的下一段")
+         section.font = .boldSystemFont(ofSize: 13)
+         stack.addArrangedSubview(section)
+@@ -1209,7 +1307,7 @@ final class DetailPanel: NSView {
+         hint.preferredMaxLayoutWidth = 420
+         stack.addArrangedSubview(hint)
+ 
+-        for other in all where other.id != clip.id {
++        for other in all where other.id != clip.id && !other.isCursorInteractionMaterial {
+             let otherIndex = all.firstIndex(where: { $0.id == other.id }) ?? 0
+             let score = TransitionMatcher.score(from: clip, to: other)
+             let row = NSStackView()
+@@ -1236,6 +1334,47 @@ final class DetailPanel: NSView {
+         }
+     }
+ 
++    private func appendCursorPreyEditor(clip: PetClip) {
++        let settings = clip.cursorPreySettings ?? CursorPreySettings()
++        let section = NSTextField(labelWithString: "互动目标大小")
++        section.font = .boldSystemFont(ofSize: 13)
++        stack.addArrangedSubview(section)
++
++        let row = NSStackView()
++        row.orientation = .horizontal
++        row.spacing = 8
++
++        let slider = NSSlider()
++        slider.minValue = CursorInteractionPolicy.minimumPreyDisplaySize
++        slider.maxValue = CursorInteractionPolicy.maximumPreyDisplaySize
++        slider.doubleValue = settings.displaySize
++        slider.isContinuous = true
++        slider.target = self
++        slider.action = #selector(cursorPreySizeChanged(_:))
++        slider.identifier = NSUserInterfaceItemIdentifier(clip.id)
++        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
++
++        let sizeLabel = NSTextField(labelWithString: Self.preySizeText(settings.displaySize))
++        sizeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
++        sizeLabel.identifier = NSUserInterfaceItemIdentifier("cursorPreySizeLabel")
++
++        let resetButton = NSButton(title: "恢复默认", target: self, action: #selector(resetCursorPreySize(_:)))
++        resetButton.bezelStyle = .rounded
++        resetButton.identifier = NSUserInterfaceItemIdentifier(clip.id)
++
++        row.addArrangedSubview(slider)
++        row.addArrangedSubview(sizeLabel)
++        row.addArrangedSubview(resetButton)
++        stack.addArrangedSubview(row)
++
++        stack.addArrangedSubview(cursorPreyPreview)
++        cursorPreyPreview.load(clip: clip, displaySize: settings.displaySize)
++    }
++
++    private static func preySizeText(_ displaySize: Double) -> String {
++        "\(Int(displaySize.rounded())) pt"
++    }
++
+     @objc private func renameCurrent(_ sender: NSButton) {
+         guard let clipID = sender.identifier?.rawValue else { return }
+         let alert = NSAlert()
+@@ -1282,6 +1421,188 @@ final class DetailPanel: NSView {
+         guard let clipID = sender.identifier?.rawValue else { return }
+         onToggleTag?(clipID, ClipTag.petting)
+     }
++
++    @objc private func toggleCursorPrey(_ sender: NSButton) {
++        guard let clipID = sender.identifier?.rawValue else { return }
++        onToggleCursorPrey?(clipID, sender.state == .on)
++    }
++
++    @objc private func toggleCursorInteraction(_ sender: NSButton) {
++        guard let clipID = sender.identifier?.rawValue else { return }
++        onToggleCursorInteraction?(clipID, sender.state == .on)
++    }
++
++    @objc private func cursorPreySizeChanged(_ sender: NSSlider) {
++        guard let clipID = sender.identifier?.rawValue else { return }
++        let displaySize = CursorInteractionPolicy.clampedPreyDisplaySize(sender.doubleValue)
++        sender.doubleValue = displaySize
++        updateCursorPreySizeEditor(displaySize)
++        onCursorPreyDisplaySizeChanged?(clipID, displaySize)
++    }
++
++    @objc private func resetCursorPreySize(_ sender: NSButton) {
++        guard let clipID = sender.identifier?.rawValue else { return }
++        let displaySize = CursorInteractionPolicy.defaultPreyDisplaySize
++        updateCursorPreySizeEditor(displaySize)
++        onCursorPreyDisplaySizeChanged?(clipID, displaySize)
++    }
++
++    private func updateCursorPreySizeEditor(_ displaySize: Double) {
++        let value = CursorInteractionPolicy.clampedPreyDisplaySize(displaySize)
++        stack.arrangedSubviews.compactMap { $0 as? NSStackView }.forEach { row in
++            row.arrangedSubviews.compactMap { $0 as? NSSlider }
++                .first(where: { $0.identifier?.rawValue == clipID })?
++                .doubleValue = value
++            row.arrangedSubviews.compactMap { $0 as? NSTextField }
++                .first(where: { $0.identifier?.rawValue == "cursorPreySizeLabel" })?
++                .stringValue = Self.preySizeText(value)
++        }
++        cursorPreyPreview.setDisplaySize(value)
++    }
++}
++
++// MARK: - Cursor-prey size preview
++
++/// Shows the target at the exact point size used by the cursor overlay while
++/// keeping a stable checkerboard canvas around it for alpha inspection.
++@MainActor
++private final class CursorPreyPreview: NSView {
++    private let canvas = NSView()
++    private let imageView = NSImageView()
++    private var imageWidthConstraint: NSLayoutConstraint!
++    private var imageHeightConstraint: NSLayoutConstraint!
++    private var timer: Timer?
++    private var clipID: String?
++    private var frameCount = 1
++    private var fps = 24.0
++    private var currentFrame = 1
++    private var aspectRatio = 1.0
++    private var cache: [Int: NSImage] = [:]
++    private var cacheOrder: [Int] = []
++    private let cacheLimit = 40
++
++    private static let checkerboard: NSColor = {
++        let side: CGFloat = 16
++        let half = side / 2
++        let image = NSImage(size: NSSize(width: side, height: side))
++        image.lockFocus()
++        NSColor(calibratedWhite: 0.92, alpha: 1).setFill()
++        NSRect(x: 0, y: 0, width: side, height: side).fill()
++        NSColor(calibratedWhite: 0.82, alpha: 1).setFill()
++        NSRect(x: 0, y: 0, width: half, height: half).fill()
++        NSRect(x: half, y: half, width: half, height: half).fill()
++        image.unlockFocus()
++        return NSColor(patternImage: image)
++    }()
++
++    override init(frame frameRect: NSRect) {
++        super.init(frame: frameRect)
++        setup()
++    }
++
++    @available(*, unavailable)
++    required init?(coder: NSCoder) { fatalError() }
++
++    private func setup() {
++        canvas.translatesAutoresizingMaskIntoConstraints = false
++        canvas.wantsLayer = true
++        canvas.layer?.backgroundColor = Self.checkerboard.cgColor
++        canvas.layer?.cornerRadius = 8
++        canvas.layer?.masksToBounds = true
++        canvas.layer?.borderWidth = 0.5
++        canvas.layer?.borderColor = NSColor.separatorColor.cgColor
++        addSubview(canvas)
++
++        imageView.translatesAutoresizingMaskIntoConstraints = false
++        imageView.imageScaling = .scaleAxesIndependently
++        canvas.addSubview(imageView)
++        imageWidthConstraint = imageView.widthAnchor.constraint(equalToConstant: CursorInteractionPolicy.defaultPreyDisplaySize)
++        imageHeightConstraint = imageView.heightAnchor.constraint(equalToConstant: CursorInteractionPolicy.defaultPreyDisplaySize)
++
++        NSLayoutConstraint.activate([
++            widthAnchor.constraint(equalToConstant: 260),
++            canvas.topAnchor.constraint(equalTo: topAnchor),
++            canvas.leadingAnchor.constraint(equalTo: leadingAnchor),
++            canvas.widthAnchor.constraint(equalToConstant: 240),
++            canvas.heightAnchor.constraint(equalToConstant: 180),
++            canvas.bottomAnchor.constraint(equalTo: bottomAnchor),
++            imageView.centerXAnchor.constraint(equalTo: canvas.centerXAnchor),
++            imageView.centerYAnchor.constraint(equalTo: canvas.centerYAnchor),
++            imageWidthConstraint,
++            imageHeightConstraint
++        ])
++    }
++
++    override func viewDidMoveToWindow() {
++        super.viewDidMoveToWindow()
++        if window == nil { stop() }
++    }
++
++    func load(clip: PetClip, displaySize: Double) {
++        stop()
++        clipID = clip.id
++        frameCount = max(1, clip.frameCount)
++        fps = clip.fps > 0 ? clip.fps : 24
++        aspectRatio = clip.displayWidth > 0 && clip.displayHeight > 0
++            ? Double(clip.displayWidth) / Double(clip.displayHeight)
++            : 1
++        cache.removeAll()
++        cacheOrder.removeAll()
++        currentFrame = 1
++        setDisplaySize(displaySize)
++        showFrame(1)
++        startPlaying()
++    }
++
++    func setDisplaySize(_ displaySize: Double) {
++        let longestSide = CGFloat(CursorInteractionPolicy.clampedPreyDisplaySize(displaySize))
++        let safeAspectRatio = max(aspectRatio, 0.0001)
++        if safeAspectRatio >= 1 {
++            imageWidthConstraint.constant = longestSide
++            imageHeightConstraint.constant = longestSide / safeAspectRatio
++        } else {
++            imageWidthConstraint.constant = longestSide * safeAspectRatio
++            imageHeightConstraint.constant = longestSide
++        }
++        layoutSubtreeIfNeeded()
++    }
++
++    func stop() {
++        timer?.invalidate()
++        timer = nil
++    }
++
++    private func startPlaying() {
++        guard frameCount > 1 else { return }
++        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
++            Task { @MainActor in self?.tick() }
++        }
++        RunLoop.main.add(timer, forMode: .common)
++        self.timer = timer
++    }
++
++    private func tick() {
++        showFrame(currentFrame % frameCount + 1)
++    }
++
++    private func showFrame(_ index: Int) {
++        currentFrame = index
++        imageView.image = frameImage(at: index)
++    }
++
++    private func frameImage(at index: Int) -> NSImage? {
++        guard let clipID else { return nil }
++        if let image = cache[index] { return image }
++        guard let image = NSImage(contentsOf: AppPaths.frameURL(clipID: clipID, index: index)) else {
++            return nil
++        }
++        cache[index] = image
++        cacheOrder.append(index)
++        if cacheOrder.count > cacheLimit {
++            cache.removeValue(forKey: cacheOrder.removeFirst())
++        }
++        return image
++    }
+ }
+ 
+ // MARK: - Full-clip preview player
+diff --git a/Sources/DesktopPet/PlaylistEngine.swift b/Sources/DesktopPet/PlaylistEngine.swift
+index 1b4f32d..0ed178c 100644
+--- a/Sources/DesktopPet/PlaylistEngine.swift
++++ b/Sources/DesktopPet/PlaylistEngine.swift
+@@ -54,7 +54,7 @@ final class PlaylistEngine {
+         RunLoop.main.add(timer!, forMode: .common)
+     }
+ 
+-    func playClip(id: String) {
++    func playClip(id: String, notifyingObservers: Bool = true) {
+         holdingAtEnd = false
+         pendingNextID = nil
+         currentClipID = id
+@@ -62,7 +62,9 @@ final class PlaylistEngine {
+         remember(id)
+         store?.recordPlay(id: id)
+         restartTimer()
+-        NotificationCenter.default.post(name: .playbackDidChange, object: id)
++        if notifyingObservers {
++            NotificationCenter.default.post(name: .playbackDidChange, object: id)
++        }
+     }
+ 
+     /// Start playing from the first item in the current playable set.
+@@ -74,8 +76,11 @@ final class PlaylistEngine {
+     func stop() {
+         timer?.invalidate()
+         timer = nil
++        currentClipID = nil
++        currentFrameIndex = 1
+         holdingAtEnd = false
+         pendingNextID = nil
++        endingSoonFired = false
+     }
+ 
+     /// Release a clip-end hold. If `playNext` is true, play the queued next clip (or loop).
+

@@ -27,6 +27,17 @@ public struct PersistedIdleDelay: Codable, Equatable, Sendable {
     }
 }
 
+public enum HIDIdleTimeQuery {
+    public typealias Query = (UInt32) -> TimeInterval
+
+    /// CoreGraphics defines kCGAnyInputEventType as `~0`.
+    public static let anyInputEventTypeRawValue = UInt32.max
+
+    public static func secondsSinceAnyInput(_ query: Query) -> TimeInterval {
+        query(anyInputEventTypeRawValue)
+    }
+}
+
 public enum IdlePresentationPolicy {
     public static let supportedIdleDelays: [TimeInterval] = [60, 180, 300, 600, 900, 1800]
     public static let defaultIdleDelay: TimeInterval = 300

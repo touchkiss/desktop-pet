@@ -1,0 +1,132 @@
+--- before/PetClipPresentationPolicy.swift
++++ after/PetClipPresentationPolicy.swift
+@@ -79,12 +79,14 @@
+         width: Int,
+         height: Int,
+         clipScale: Double,
+-        globalScale: Double
++        globalScale: Double,
++        presentationMultiplier: Double = 1
+     ) -> CGSize {
+-        let scale = effectiveScale(clipScale: clipScale, globalScale: globalScale)
++        let normalScale = effectiveScale(clipScale: clipScale, globalScale: globalScale)
++        let extraScale = presentationMultiplier.isFinite ? max(1, presentationMultiplier) : 1
+         return CGSize(
+-            width: CGFloat(max(0, width)) * scale,
+-            height: CGFloat(max(0, height)) * scale
++            width: CGFloat(max(0, width)) * normalScale * extraScale,
++            height: CGFloat(max(0, height)) * normalScale * extraScale
+         )
+     }
+ 
+--- before/PetClipPresentationPolicyTests.swift
++++ after/PetClipPresentationPolicyTests.swift
+@@ -21,6 +21,18 @@
+         XCTAssertEqual(size.height, 192.0, accuracy: 0.0001)
+     }
+ 
++    func testDisplaySizeAppliesPresentationMultiplierAfterNormalScale() {
++        let size = PetClipPresentationPolicy.displaySize(
++            width: 100,
++            height: 50,
++            clipScale: 0.8,
++            globalScale: 1.5,
++            presentationMultiplier: 2
++        )
++        XCTAssertEqual(size.width, 240, accuracy: 0.0001)
++        XCTAssertEqual(size.height, 120, accuracy: 0.0001)
++    }
++
+     func testTabsSeparateOnlyCursorPreyFromCats() {
+         let entries = [
+             ClipLibraryEntry(id: "ordinary", isCursorPrey: false),
+--- before/Models.swift
++++ after/Models.swift
+@@ -93,14 +93,13 @@
+         globalScale: Double,
+         presentationMultiplier: Double = 1
+     ) -> CGSize {
+-        let normal = PetClipPresentationPolicy.displaySize(
++        PetClipPresentationPolicy.displaySize(
+             width: displayWidth,
+             height: displayHeight,
+             clipScale: clipScale,
+-            globalScale: globalScale
++            globalScale: globalScale,
++            presentationMultiplier: presentationMultiplier
+         )
+-        let multiplier = presentationMultiplier.isFinite ? max(1, presentationMultiplier) : 1
+-        return CGSize(width: normal.width * multiplier, height: normal.height * multiplier)
+     }
+ 
+     var duration: TimeInterval {
+--- before/PetWindowController.swift
++++ after/PetWindowController.swift
+@@ -111,6 +111,7 @@
+     private var frameCache: (clipID: String, index: Int, image: NSImage)?
+     private var petDisplaySize: CGSize = .zero
+     private var effectPadding: CGFloat = 0
++    private(set) var idlePresentationPhase: IdlePresentationPhase = .normal
+ 
+     var onTeleportDragCancel: (() -> Void)?
+     /// Quick click on the cat — petting.
+@@ -210,6 +211,22 @@
+         window?.frame ?? .zero
+     }
+ 
++    func setIdlePresentationPhase(_ phase: IdlePresentationPhase) {
++        guard idlePresentationPhase != phase else { return }
++        idlePresentationPhase = phase
++        refreshFrame()
++    }
++
++    func effectiveDisplaySize(for clip: PetClip) -> CGSize {
++        clip.effectiveDisplaySize(
++            globalScale: store.state.petScale,
++            presentationMultiplier: IdlePresentationPolicy.presentationMultiplier(
++                manicScale: store.state.manicScale,
++                phase: idlePresentationPhase
++            )
++        )
++    }
++
+     /// Snapshot of the current pet image (for the tile-swarm journey).
+     func petSnapshot() -> CGImage? {
+         guard let rep = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) else {
+@@ -362,7 +379,7 @@
+             return
+         }
+ 
+-        let displaySize = clip.effectiveDisplaySize(globalScale: store.state.petScale)
++        let displaySize = effectiveDisplaySize(for: clip)
+         let w = displaySize.width
+         let h = displaySize.height
+         petDisplaySize = displaySize
+@@ -375,8 +392,14 @@
+             let bottom = frame.minY
+             let centerX = frame.midX
+             frame.size = NSSize(width: w + effectPadding * 2, height: h + effectPadding * 2)
+-            frame.origin.x = centerX - frame.size.width / 2
+-            frame.origin.y = bottom
++            frame.origin = CGPoint(x: centerX - frame.width / 2, y: bottom)
++            if let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame {
++                frame.origin = TeleportMath.clampOrigin(
++                    frame.origin,
++                    petSize: frame.size,
++                    visibleFrame: visibleFrame
++                )
++            }
+             window.setFrame(frame, display: true)
+         }
+ 
+--- before/TeleportController.swift
++++ after/TeleportController.swift
+@@ -422,7 +422,7 @@
+     private func placeLandingFrame() {
+         guard let clipID = engine.currentClipID,
+               let clip = store.clip(id: clipID) else { return }
+-        let size = clip.effectiveDisplaySize(globalScale: store.state.petScale)
++        let size = pet.effectiveDisplaySize(for: clip)
+         pet.setTeleportLandingFrame(center: travelTo, size: size)
+     }
+ 

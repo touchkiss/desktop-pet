@@ -1,4 +1,12 @@
 import Foundation
+import DesktopPetCore
+
+enum OneShotCancellationReason {
+    case replacedByPlayback
+    case stopped
+    case requestedRestore
+    case sourceInvalidated
+}
 
 @MainActor
 final class PlaylistEngine {
@@ -13,6 +21,16 @@ final class PlaylistEngine {
     private var holdingAtEnd = false
     private var pendingNextID: String?
     private var endingSoonFired = false
+    private var oneShotState = OneShotPlaybackState()
+    private var oneShotCompletionHandler: (() -> Void)?
+    private var oneShotCancellationHandler: ((OneShotCancellationReason) -> Void)?
+    private var playbackRevision: UInt = 0
+    private var timerRevision: UInt = 0
+
+    /// True only while a cursor-interaction clip is replacing a held ordinary clip.
+    var isPlayingOneShot: Bool {
+        oneShotState.isActive
+    }
 
     /// Called when a clip reaches its last frame. Return `true` to advance immediately,
     /// or `false` to hold on the last frame (caller must later call `resumeAfterHold`).
@@ -27,6 +45,7 @@ final class PlaylistEngine {
     func attach(store: LibraryStore) {
         self.store = store
         if currentClipID == nil {
+            advancePlaybackRevision()
             currentClipID = store.state.playableClips.first?.id
             currentFrameIndex = 1
         }
@@ -34,7 +53,7 @@ final class PlaylistEngine {
     }
 
     func restartTimer() {
-        timer?.invalidate()
+        invalidateTimer()
         holdingAtEnd = false
         pendingNextID = nil
         endingSoonFired = false
@@ -42,19 +61,36 @@ final class PlaylistEngine {
               let id = currentClipID,
               let clip = store.clip(id: id),
               clip.frameCount > 0,
+              clip.fps.isFinite,
               clip.fps > 0 else {
             return
         }
         let interval = 1.0 / clip.fps
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.tick()
+        guard interval.isFinite, interval > 0 else { return }
+
+        let revision = timerRevision
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.tick(timerRevision: revision)
             }
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     func playClip(id: String) {
+        playClip(id: id, notifyingObservers: true)
+    }
+
+    func playClip(id: String, notifyingObservers: Bool) {
+        let requestRevision = advancePlaybackRevision()
+        cancelOneShot(reason: .replacedByPlayback)
+        guard PlaybackRevisionPolicy.shouldAccept(
+            expected: requestRevision,
+            current: playbackRevision
+        ) else {
+            return
+        }
         holdingAtEnd = false
         pendingNextID = nil
         currentClipID = id
@@ -62,7 +98,55 @@ final class PlaylistEngine {
         remember(id)
         store?.recordPlay(id: id)
         restartTimer()
+        if notifyingObservers {
+            NotificationCenter.default.post(name: .playbackDidChange, object: id)
+        }
+    }
+
+    /// Replaces an active clip-end hold with one cursor-interaction pass.
+    /// The hold's queued ordinary clip remains the preferred return target.
+    @discardableResult
+    func playHeldCursorInteraction(
+        id: String,
+        completion: @escaping () -> Void = {},
+        cancellation: @escaping (OneShotCancellationReason) -> Void = { _ in }
+    ) -> Bool {
+        guard holdingAtEnd,
+              let store,
+              let clip = store.clip(id: id),
+              clip.tags.contains(ClipTag.cursorInteraction),
+              clip.frameCount > 0,
+              clip.fps.isFinite,
+              clip.fps > 0 else {
+            return false
+        }
+        let interval = 1.0 / clip.fps
+        guard interval.isFinite, interval > 0 else { return false }
+
+        let preferredReturnID = pendingNextID
+        let requestRevision = advancePlaybackRevision()
+        cancelOneShot(reason: .replacedByPlayback)
+        guard PlaybackRevisionPolicy.shouldAccept(
+            expected: requestRevision,
+            current: playbackRevision
+        ) else {
+            return false
+        }
+        holdingAtEnd = false
+        pendingNextID = nil
+        endingSoonFired = false
+        oneShotState.start(interactionID: id, preferredReturnID: preferredReturnID)
+        oneShotCompletionHandler = completion
+        oneShotCancellationHandler = cancellation
+        currentClipID = id
+        currentFrameIndex = 1
+        store.recordPlay(id: id)
+        restartTimer()
         NotificationCenter.default.post(name: .playbackDidChange, object: id)
+        return PlaybackRevisionPolicy.shouldAccept(
+            expected: requestRevision,
+            current: playbackRevision
+        ) && oneShotState.isActive && currentClipID == id
     }
 
     /// Start playing from the first item in the current playable set.
@@ -72,10 +156,44 @@ final class PlaylistEngine {
     }
 
     func stop() {
-        timer?.invalidate()
-        timer = nil
+        let requestRevision = advancePlaybackRevision()
+        cancelOneShot(reason: .stopped)
+        guard PlaybackRevisionPolicy.shouldAccept(
+            expected: requestRevision,
+            current: playbackRevision
+        ) else {
+            return
+        }
+        invalidateTimer()
+        currentClipID = nil
+        currentFrameIndex = 1
         holdingAtEnd = false
         pendingNextID = nil
+        endingSoonFired = false
+        NotificationCenter.default.post(name: .playbackDidChange, object: nil)
+    }
+
+    /// Cancels an interrupted one-shot and restores its best valid ordinary target.
+    func cancelOneShotAndRestore(
+        reason: OneShotCancellationReason = .requestedRestore
+    ) {
+        guard let resolution = oneShotState.finish(
+            availableOrdinaryIDs: store?.state.playableClips.map(\.id) ?? []
+        ) else {
+            return
+        }
+        let cancellation = oneShotCancellationHandler
+        oneShotCompletionHandler = nil
+        oneShotCancellationHandler = nil
+        let cancellationRevision = playbackRevision
+        cancellation?(reason)
+        guard PlaybackRevisionPolicy.shouldAccept(
+            expected: cancellationRevision,
+            current: playbackRevision
+        ) else {
+            return
+        }
+        playOneShotResolution(resolution)
     }
 
     /// Release a clip-end hold. If `playNext` is true, play the queued next clip (or loop).
@@ -85,6 +203,7 @@ final class PlaylistEngine {
         holdingAtEnd = false
         pendingNextID = nil
         guard playNext else {
+            advancePlaybackRevision()
             currentFrameIndex = 1
             endingSoonFired = false
             return
@@ -92,24 +211,42 @@ final class PlaylistEngine {
         if let next {
             playClip(id: next)
         } else {
+            advancePlaybackRevision()
             currentFrameIndex = 1
             endingSoonFired = false
         }
     }
 
-    private func tick() {
+    private func tick(timerRevision: UInt) {
+        guard PlaybackRevisionPolicy.shouldAccept(
+            expected: timerRevision,
+            current: self.timerRevision
+        ) else {
+            return
+        }
         if holdingAtEnd { return }
 
         guard let store,
               let id = currentClipID,
               let clip = store.clip(id: id) else {
+            if isPlayingOneShot {
+                cancelOneShotAndRestore(reason: .sourceInvalidated)
+                return
+            }
             stop()
             return
         }
 
         if currentFrameIndex < clip.frameCount {
             currentFrameIndex += 1
-            notifyEndingSoonIfNeeded(clip: clip)
+            if !isPlayingOneShot {
+                notifyEndingSoonIfNeeded(clip: clip)
+            }
+            return
+        }
+
+        if isPlayingOneShot {
+            completeOneShot()
             return
         }
 
@@ -129,11 +266,66 @@ final class PlaylistEngine {
     }
 
     private func notifyEndingSoonIfNeeded(clip: PetClip) {
-        guard !endingSoonFired, clip.fps > 0 else { return }
+        guard !endingSoonFired,
+              clip.fps.isFinite,
+              clip.fps > 0 else {
+            return
+        }
         let remaining = Double(clip.frameCount - currentFrameIndex) / clip.fps
         guard remaining <= endingSoonLeadTime else { return }
         endingSoonFired = true
         clipEndingSoonHandler?(max(0, remaining))
+    }
+
+    private func completeOneShot() {
+        guard let resolution = oneShotState.finish(
+            availableOrdinaryIDs: store?.state.playableClips.map(\.id) ?? []
+        ) else {
+            return
+        }
+        let completion = oneShotCompletionHandler
+        oneShotCompletionHandler = nil
+        oneShotCancellationHandler = nil
+        let completionRevision = playbackRevision
+        completion?()
+        guard OneShotPlaybackState.shouldApplyCompletionResolution(
+            completionRevision: completionRevision,
+            currentPlaybackRevision: playbackRevision
+        ) else {
+            return
+        }
+        playOneShotResolution(resolution)
+    }
+
+    @discardableResult
+    private func cancelOneShot(reason: OneShotCancellationReason) -> Bool {
+        guard oneShotState.cancel() != nil else { return false }
+        let cancellation = oneShotCancellationHandler
+        oneShotCompletionHandler = nil
+        oneShotCancellationHandler = nil
+        cancellation?(reason)
+        return true
+    }
+
+    @discardableResult
+    private func advancePlaybackRevision() -> UInt {
+        playbackRevision &+= 1
+        return playbackRevision
+    }
+
+    private func invalidateTimer() {
+        timerRevision &+= 1
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func playOneShotResolution(_ resolution: OneShotPlaybackState.Resolution) {
+        switch resolution {
+        case let .play(id):
+            playClip(id: id)
+        case .stop:
+            stop()
+        }
     }
 
     private func pickNext(after clip: PetClip, store: LibraryStore) -> String? {

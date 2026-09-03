@@ -29,6 +29,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var syncTimer: Timer?
     private var lastRendered: (String?, Int) = (nil, -1)
     private var wasImporting = false
+    private let idleDisplaySleepController = IOKitIdleDisplaySleepController()
+    private var idlePresentationTimer: Timer?
+    private var currentIdlePresentationPhase: IdlePresentationPhase = .normal
+    private var isRecoveringDisplaySleepSetting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         engine.attach(store: store)
@@ -66,6 +70,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
         openLibrary()
+        synchronizeIdleDisplaySleep()
+        updateIdlePresentation()
+
+        idlePresentationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateIdlePresentation()
+            }
+        }
+        if let idlePresentationTimer {
+            RunLoop.main.add(idlePresentationTimer, forMode: .common)
+        }
 
         syncTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -84,6 +99,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.handleLibraryChange()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .idlePresentationSettingsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleIdlePresentationSettingsChange()
             }
         }
 
@@ -137,6 +161,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if engine.currentClipID == nil, let id = store.state.playableClips.first?.id {
             engine.playClip(id: id)
         } else if let id = engine.currentClipID, store.clip(id: id) == nil {
+            if engine.isPlayingOneShot {
+                engine.cancelOneShotAndRestore(reason: .sourceInvalidated)
+            } else if let next = store.state.playableClips.first?.id {
+                engine.playClip(id: next)
+            } else {
+                engine.stop()
+                petWindow?.refreshFrame()
+            }
+        } else if let id = engine.currentClipID,
+                  let clip = store.clip(id: id),
+                  engine.isPlayingOneShot,
+                  !clip.tags.contains(ClipTag.cursorInteraction) {
+            engine.cancelOneShotAndRestore(reason: .sourceInvalidated)
+        } else if let id = engine.currentClipID,
+                  store.clip(id: id)?.isCursorInteractionMaterial == true,
+                  !engine.isPlayingOneShot {
             if let next = store.state.playableClips.first?.id {
                 engine.playClip(id: next)
             } else {
@@ -147,7 +187,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engine.restartTimer()
             petWindow?.refreshFrame()
         }
-        libraryWindow?.reload(preservingSelection: true)
+    }
+
+    private func handleIdlePresentationSettingsChange() {
+        synchronizeIdleDisplaySleep()
+        updateIdlePresentation(forceRefresh: true)
+    }
+
+    private func synchronizeIdleDisplaySleep() {
+        guard !isRecoveringDisplaySleepSetting else { return }
+        do {
+            try idleDisplaySleepController.setEnabled(store.state.preventIdleDisplaySleep)
+        } catch {
+            isRecoveringDisplaySleepSetting = true
+            let previousLastError = store.lastError
+            let saveError = store.update { $0.preventIdleDisplaySleep = false }
+            isRecoveringDisplaySleepSetting = false
+            if let saveError {
+                if previousLastError == nil {
+                    store.consumeLastError(ifMatching: saveError)
+                }
+                libraryWindow?.presentIdleSettingsSaveError(saveError)
+            }
+            libraryWindow?.refreshIdlePresentationControls()
+            libraryWindow?.presentIdleDisplaySleepError(error.localizedDescription)
+        }
+    }
+
+    private func updateIdlePresentation(forceRefresh: Bool = false) {
+        let rawIdle = HIDIdleTimeQuery.secondsSinceAnyInput { eventTypeRawValue in
+            guard let eventType = CGEventType(rawValue: eventTypeRawValue) else { return 0 }
+            return CGEventSource.secondsSinceLastEventType(
+                .hidSystemState,
+                eventType: eventType
+            )
+        }
+        let phase = IdlePresentationPolicy.phase(
+            idleSeconds: rawIdle,
+            delay: store.state.manicIdleDelay
+        )
+        guard phase != currentIdlePresentationPhase else {
+            if forceRefresh {
+                petWindow?.refreshFrame()
+            }
+            return
+        }
+        currentIdlePresentationPhase = phase
+        petWindow?.setIdlePresentationPhase(phase)
     }
 
     private func syncPetFrame() {
@@ -227,7 +313,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handlePetTapped() {
-        let candidates = store.state.clips.filter { $0.tags.contains(ClipTag.petting) }
+        let candidates = store.state.clips.filter {
+            $0.tags.contains(ClipTag.petting) && !$0.isCursorInteractionMaterial
+        }
         if let clip = candidates.randomElement() {
             engine.playClip(id: clip.id)
         }
@@ -262,14 +350,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func openLibrary() {
         if let libraryWindow {
-            libraryWindow.reload()
             libraryWindow.showWindow(nil)
+            libraryWindow.reload()
             NSApp.activate(ignoringOtherApps: true)
             return
         }
         let wc = LibraryWindowController(store: store, engine: engine)
         libraryWindow = wc
         wc.showWindow(nil)
+        wc.reload()
         wc.window?.center()
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -287,6 +376,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func quit() {
         teleportController?.stop()
+        do {
+            try idleDisplaySleepController.setEnabled(false)
+        } catch {
+            NSLog("DesktopPet: %@", error.localizedDescription)
+        }
         NSApp.terminate(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        idlePresentationTimer?.invalidate()
+        idlePresentationTimer = nil
+        do {
+            try idleDisplaySleepController.setEnabled(false)
+        } catch {
+            NSLog("DesktopPet: %@", error.localizedDescription)
+        }
     }
 }

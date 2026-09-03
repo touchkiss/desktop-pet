@@ -1,0 +1,506 @@
+  the first valid ordinary clip.
+- **No ordinary fallback:** state resolution selects `.stop`, and `stop()` clears
+  the timer, current clip, frame index, hold, and one-shot context before posting
+  the notification.
+- **Cancellation:** ordinary `playClip(id:)` and `stop()` clear the state and
+  completion closure without executing it. Source disappearance is handled in
+  both the next tick and AppDelegate library synchronization by restoration
+  without the normal completion callback.
+- **Notifications:** every visible clip replacement and stop posts only after
+  its observable state is updated; AppDelegate listens to library changes rather
+  than playback notifications, avoiding a library-notification loop.
+
+## Concerns
+
+None.
+
+## Review fixes
+
+### Root cause
+
+`completeOneShot()` cleared its state and invoked the completion callback before
+unconditionally applying the captured ordinary-playback resolution. A synchronous
+callback could call `stop()` or `playClip(id:)`, but the stale resolution would
+then overwrite that newer visible playback choice. Separately, library
+synchronization accepted any still-present special clip while a one-shot was
+active, even if a role edit had removed `cursorInteraction` from its source.
+
+### TDD evidence
+
+1. Added `testCompletionResolutionOnlyAppliesWhileCompletedInteractionRemainsVisible`
+   to `OneShotPlaybackStateTests` before the helper implementation.
+2. Ran `swift test --filter OneShotPlaybackStateTests`; expected RED compilation
+   failure: `OneShotPlaybackState` had no
+   `shouldApplyCompletionResolution` member.
+3. Added the pure helper and used it in `PlaylistEngine.completeOneShot()`.
+4. Reran the focused test: GREEN, 6 tests passed with 0 failures.
+
+### Changes
+
+- `completeOneShot()` captures the completed interaction ID before clearing state,
+  invokes the callback, then restores its captured resolution only when that same
+  interaction is still the visible current clip. A callback that stops playback
+  or selects another clip now wins.
+- Added the small deterministic `OneShotPlaybackState.shouldApplyCompletionResolution`
+  helper and its direct state-test coverage.
+- `AppDelegate.handleLibraryChange()` now cancels and restores an active one-shot
+  when its still-present current source no longer has the `cursorInteraction`
+  tag, instead of restarting the invalid role-changed clip.
+
+### Verification
+
+| Command | Result |
+| --- | --- |
+| `swift test --filter OneShotPlaybackStateTests` | RED as above, then GREEN: 6 tests, 0 failures. |
+| `swift test` | Passed: 38 XCTest cases, 0 failures. |
+| `swift build` | Passed: debug build complete. |
+| `git diff --check -- Sources/DesktopPet/PlaylistEngine.swift Sources/DesktopPet/AppDelegate.swift Sources/DesktopPetCore/OneShotPlaybackState.swift Tests/DesktopPetTests/OneShotPlaybackStateTests.swift` | Passed: no whitespace errors. |
+
+### Review self-check
+
+- A completion callback that calls `stop()` leaves `currentClipID == nil`; the
+  guard returns without stale restoration.
+- A callback that selects another clip changes `currentClipID`; the guard returns
+  without stale restoration.
+- A callback that leaves the completed interaction current permits normal queued
+  restoration exactly as before.
+- A deleted source is handled by the existing missing-clip path; a present but
+  retagged source is handled by the new role-validation path.
+
+## Second review fixes
+
+### Root cause
+
+The first reentrancy guard compared only the interaction clip ID after running
+the completion callback. A callback could start a new playback session for that
+same ID, leaving the ID unchanged and allowing the old one-shot resolution to
+overwrite the new session.
+
+### TDD evidence
+
+1. Replaced the ID-based helper test with
+   `testCompletionResolutionRejectsANewSameIDSessionWithChangedRevision` before
+   the implementation.
+2. Ran `swift test --filter OneShotPlaybackStateTests`; expected RED compilation
+   failure reported the old helper's incompatible `completedInteractionID` /
+   `currentClipID` signature.
+3. Implemented the revision comparison and reran the focused suite: GREEN,
+   6 tests passed with 0 failures.
+
+### Changes
+
+- Added a monotonic `playbackRevision` to `PlaylistEngine`.
+- It advances for every explicit visible playback command/session start:
+  initial attachment assignment, `playClip`, `stop`, held one-shot start, and
+  both same-clip hold-resume paths. Commands that transition to another clip
+  use `playClip` and therefore advance through the same path.
+- `completeOneShot()` captures the revision immediately before invoking its
+  completion handler. Its previously captured resolution applies only if the
+  revision is unchanged after that synchronous callback returns.
+- Updated the pure helper to compare revisions rather than IDs. Thus, a callback
+  that restarts the same clip is correctly treated as a newer playback session
+  and cannot be overwritten by stale restoration.
+
+### Verification
+
+| Command | Result |
+| --- | --- |
+| `swift test --filter OneShotPlaybackStateTests` | RED as above, then GREEN: 6 tests, 0 failures. |
+| `swift test` | Passed: 38 XCTest cases, 0 failures. |
+| `swift build` | Passed: debug build complete. |
+| `git diff --check -- Sources/DesktopPet/PlaylistEngine.swift Sources/DesktopPet/AppDelegate.swift Sources/DesktopPetCore/OneShotPlaybackState.swift Tests/DesktopPetTests/OneShotPlaybackStateTests.swift` | Passed: no whitespace errors. |
+
+### Review self-check
+
+- A callback that stops, starts another clip, or starts a new pass of the same
+  clip advances the revision; the stale resolution is rejected.
+- A callback that makes no playback command leaves the revision unchanged; the
+  ordinary return resolution proceeds exactly once.
+- The callback is still read and cleared before invocation, so repeated ticks
+  cannot execute it twice.
+diff --git a/Sources/DesktopPet/AppDelegate.swift b/Sources/DesktopPet/AppDelegate.swift
+index 4253bcd..46b1c35 100644
+--- a/Sources/DesktopPet/AppDelegate.swift
++++ b/Sources/DesktopPet/AppDelegate.swift
+@@ -137,6 +137,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         if engine.currentClipID == nil, let id = store.state.playableClips.first?.id {
+             engine.playClip(id: id)
+         } else if let id = engine.currentClipID, store.clip(id: id) == nil {
++            if engine.isPlayingOneShot {
++                engine.cancelOneShotAndRestore()
++            } else if let next = store.state.playableClips.first?.id {
++                engine.playClip(id: next)
++            } else {
++                engine.stop()
++                petWindow?.refreshFrame()
++            }
++        } else if let id = engine.currentClipID,
++                  let clip = store.clip(id: id),
++                  engine.isPlayingOneShot,
++                  !clip.tags.contains(ClipTag.cursorInteraction) {
++            engine.cancelOneShotAndRestore()
++        } else if let id = engine.currentClipID,
++                  store.clip(id: id)?.isCursorInteractionMaterial == true,
++                  !engine.isPlayingOneShot {
+             if let next = store.state.playableClips.first?.id {
+                 engine.playClip(id: next)
+             } else {
+@@ -147,7 +163,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+             engine.restartTimer()
+             petWindow?.refreshFrame()
+         }
+-        libraryWindow?.reload(preservingSelection: true)
+     }
+ 
+     private func syncPetFrame() {
+@@ -262,14 +277,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+ 
+     @objc func openLibrary() {
+         if let libraryWindow {
+-            libraryWindow.reload()
+             libraryWindow.showWindow(nil)
++            libraryWindow.reload()
+             NSApp.activate(ignoringOtherApps: true)
+             return
+         }
+         let wc = LibraryWindowController(store: store, engine: engine)
+         libraryWindow = wc
+         wc.showWindow(nil)
++        wc.reload()
+         wc.window?.center()
+         NSApp.activate(ignoringOtherApps: true)
+     }
+diff --git a/Sources/DesktopPet/PlaylistEngine.swift b/Sources/DesktopPet/PlaylistEngine.swift
+index 1b4f32d..4894720 100644
+--- a/Sources/DesktopPet/PlaylistEngine.swift
++++ b/Sources/DesktopPet/PlaylistEngine.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import DesktopPetCore
+ 
+ @MainActor
+ final class PlaylistEngine {
+@@ -13,6 +14,14 @@ final class PlaylistEngine {
+     private var holdingAtEnd = false
+     private var pendingNextID: String?
+     private var endingSoonFired = false
++    private var oneShotState = OneShotPlaybackState()
++    private var oneShotCompletionHandler: (() -> Void)?
++    private var playbackRevision: UInt = 0
++
++    /// True only while a cursor-interaction clip is replacing a held ordinary clip.
++    var isPlayingOneShot: Bool {
++        oneShotState.isActive
++    }
+ 
+     /// Called when a clip reaches its last frame. Return `true` to advance immediately,
+     /// or `false` to hold on the last frame (caller must later call `resumeAfterHold`).
+@@ -27,6 +36,7 @@ final class PlaylistEngine {
+     func attach(store: LibraryStore) {
+         self.store = store
+         if currentClipID == nil {
++            advancePlaybackRevision()
+             currentClipID = store.state.playableClips.first?.id
+             currentFrameIndex = 1
+         }
+@@ -55,6 +65,12 @@ final class PlaylistEngine {
+     }
+ 
+     func playClip(id: String) {
++        playClip(id: id, notifyingObservers: true)
++    }
++
++    func playClip(id: String, notifyingObservers: Bool) {
++        advancePlaybackRevision()
++        cancelOneShot()
+         holdingAtEnd = false
+         pendingNextID = nil
+         currentClipID = id
+@@ -62,7 +78,41 @@ final class PlaylistEngine {
+         remember(id)
+         store?.recordPlay(id: id)
+         restartTimer()
++        if notifyingObservers {
++            NotificationCenter.default.post(name: .playbackDidChange, object: id)
++        }
++    }
++
++    /// Replaces an active clip-end hold with one cursor-interaction pass.
++    /// The hold's queued ordinary clip remains the preferred return target.
++    @discardableResult
++    func playHeldCursorInteraction(
++        id: String,
++        completion: @escaping () -> Void = {}
++    ) -> Bool {
++        guard holdingAtEnd,
++              let store,
++              let clip = store.clip(id: id),
++              clip.tags.contains(ClipTag.cursorInteraction),
++              clip.frameCount > 0,
++              clip.fps > 0 else {
++            return false
++        }
++
++        let preferredReturnID = pendingNextID
++        holdingAtEnd = false
++        pendingNextID = nil
++        endingSoonFired = false
++        advancePlaybackRevision()
++        cancelOneShot()
++        oneShotState.start(interactionID: id, preferredReturnID: preferredReturnID)
++        oneShotCompletionHandler = completion
++        currentClipID = id
++        currentFrameIndex = 1
++        store.recordPlay(id: id)
++        restartTimer()
+         NotificationCenter.default.post(name: .playbackDidChange, object: id)
++        return true
+     }
+ 
+     /// Start playing from the first item in the current playable set.
+@@ -72,10 +122,27 @@ final class PlaylistEngine {
+     }
+ 
+     func stop() {
++        advancePlaybackRevision()
+         timer?.invalidate()
+         timer = nil
++        cancelOneShot()
++        currentClipID = nil
++        currentFrameIndex = 1
+         holdingAtEnd = false
+         pendingNextID = nil
++        endingSoonFired = false
++        NotificationCenter.default.post(name: .playbackDidChange, object: nil)
++    }
++
++    /// Cancels an interrupted one-shot and restores its best valid ordinary target.
++    func cancelOneShotAndRestore() {
++        guard let resolution = oneShotState.finish(
++            availableOrdinaryIDs: store?.state.playableClips.map(\.id) ?? []
++        ) else {
++            return
++        }
++        oneShotCompletionHandler = nil
++        playOneShotResolution(resolution)
+     }
+ 
+     /// Release a clip-end hold. If `playNext` is true, play the queued next clip (or loop).
+@@ -85,6 +152,7 @@ final class PlaylistEngine {
+         holdingAtEnd = false
+         pendingNextID = nil
+         guard playNext else {
++            advancePlaybackRevision()
+             currentFrameIndex = 1
+             endingSoonFired = false
+             return
+@@ -92,6 +160,7 @@ final class PlaylistEngine {
+         if let next {
+             playClip(id: next)
+         } else {
++            advancePlaybackRevision()
+             currentFrameIndex = 1
+             endingSoonFired = false
+         }
+@@ -103,13 +172,24 @@ final class PlaylistEngine {
+         guard let store,
+               let id = currentClipID,
+               let clip = store.clip(id: id) else {
++            if isPlayingOneShot {
++                cancelOneShotAndRestore()
++                return
++            }
+             stop()
+             return
+         }
+ 
+         if currentFrameIndex < clip.frameCount {
+             currentFrameIndex += 1
+-            notifyEndingSoonIfNeeded(clip: clip)
++            if !isPlayingOneShot {
++                notifyEndingSoonIfNeeded(clip: clip)
++            }
++            return
++        }
++
++        if isPlayingOneShot {
++            completeOneShot()
+             return
+         }
+ 
+@@ -136,6 +216,43 @@ final class PlaylistEngine {
+         clipEndingSoonHandler?(max(0, remaining))
+     }
+ 
++    private func completeOneShot() {
++        guard let resolution = oneShotState.finish(
++            availableOrdinaryIDs: store?.state.playableClips.map(\.id) ?? []
++        ) else {
++            return
++        }
++        let completion = oneShotCompletionHandler
++        oneShotCompletionHandler = nil
++        let completionRevision = playbackRevision
++        completion?()
++        guard OneShotPlaybackState.shouldApplyCompletionResolution(
++            completionRevision: completionRevision,
++            currentPlaybackRevision: playbackRevision
++        ) else {
++            return
++        }
++        playOneShotResolution(resolution)
++    }
++
++    private func cancelOneShot() {
++        oneShotState.cancel()
++        oneShotCompletionHandler = nil
++    }
++
++    private func advancePlaybackRevision() {
++        playbackRevision += 1
++    }
++
++    private func playOneShotResolution(_ resolution: OneShotPlaybackState.Resolution) {
++        switch resolution {
++        case let .play(id):
++            playClip(id: id)
++        case .stop:
++            stop()
++        }
++    }
++
+     private func pickNext(after clip: PetClip, store: LibraryStore) -> String? {
+         let clips = store.state.playableClips
+         guard !clips.isEmpty else { return nil }
+diff --git a/Sources/DesktopPetCore/OneShotPlaybackState.swift b/Sources/DesktopPetCore/OneShotPlaybackState.swift
+new file mode 100644
+index 0000000..f999975
+--- /dev/null
++++ b/Sources/DesktopPetCore/OneShotPlaybackState.swift
+@@ -0,0 +1,52 @@
++import Foundation
++
++/// Pure state for a special clip that must play once before ordinary playback resumes.
++public struct OneShotPlaybackState: Equatable {
++    public enum Resolution: Equatable {
++        case play(String)
++        case stop
++    }
++
++    public private(set) var interactionID: String?
++    public private(set) var preferredReturnID: String?
++
++    public var isActive: Bool {
++        interactionID != nil
++    }
++
++    public init() {}
++
++    public mutating func start(interactionID: String, preferredReturnID: String?) {
++        self.interactionID = interactionID
++        self.preferredReturnID = preferredReturnID
++    }
++
++    public mutating func cancel() {
++        interactionID = nil
++        preferredReturnID = nil
++    }
++
++    /// Resolves an active one-shot exactly once against the current ordinary playlist.
++    public mutating func finish(availableOrdinaryIDs: [String]) -> Resolution? {
++        guard isActive else { return nil }
++        let preferredReturnID = preferredReturnID
++        cancel()
++
++        if let preferredReturnID, availableOrdinaryIDs.contains(preferredReturnID) {
++            return .play(preferredReturnID)
++        }
++        if let fallbackID = availableOrdinaryIDs.first {
++            return .play(fallbackID)
++        }
++        return .stop
++    }
++
++    /// A completion callback may synchronously start any new playback session,
++    /// including one for the same clip. That newer session must win.
++    public static func shouldApplyCompletionResolution(
++        completionRevision: UInt,
++        currentPlaybackRevision: UInt
++    ) -> Bool {
++        currentPlaybackRevision == completionRevision
++    }
++}
+diff --git a/Tests/DesktopPetTests/OneShotPlaybackStateTests.swift b/Tests/DesktopPetTests/OneShotPlaybackStateTests.swift
+new file mode 100644
+index 0000000..d3c34a9
+--- /dev/null
++++ b/Tests/DesktopPetTests/OneShotPlaybackStateTests.swift
+@@ -0,0 +1,67 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class OneShotPlaybackStateTests: XCTestCase {
++    func testStartCapturesPreferredOrdinaryReturnID() {
++        var state = OneShotPlaybackState()
++
++        state.start(interactionID: "interaction", preferredReturnID: "ordinary")
++
++        XCTAssertTrue(state.isActive)
++        XCTAssertEqual(state.interactionID, "interaction")
++        XCTAssertEqual(state.preferredReturnID, "ordinary")
++    }
++
++    func testFinishReturnsCapturedOrdinaryClipAndIsHarmlessWhenRepeated() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "ordinary")
++
++        XCTAssertEqual(
++            state.finish(availableOrdinaryIDs: ["fallback", "ordinary"]),
++            .play("ordinary")
++        )
++        XCTAssertFalse(state.isActive)
++        XCTAssertNil(state.finish(availableOrdinaryIDs: ["fallback", "ordinary"]))
++    }
++
++    func testCancelClearsActiveOneShotWithoutACompletion() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "ordinary")
++
++        state.cancel()
++
++        XCTAssertFalse(state.isActive)
++        XCTAssertNil(state.finish(availableOrdinaryIDs: ["ordinary"]))
++    }
++
++    func testFinishFallsBackToFirstAvailableOrdinaryClipWhenPreferredReturnIsInvalid() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "removed")
++
++        XCTAssertEqual(
++            state.finish(availableOrdinaryIDs: ["fallback", "another"]),
++            .play("fallback")
++        )
++    }
++
++    func testFinishStopsWhenNoOrdinaryFallbackExists() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "removed")
++
++        XCTAssertEqual(state.finish(availableOrdinaryIDs: []), .stop)
++    }
++
++    func testCompletionResolutionRejectsANewSameIDSessionWithChangedRevision() {
++        let completionRevision: UInt = 41
++        let sameIDNewSessionRevision: UInt = 42
++
++        XCTAssertTrue(OneShotPlaybackState.shouldApplyCompletionResolution(
++            completionRevision: completionRevision,
++            currentPlaybackRevision: completionRevision
++        ))
++        XCTAssertFalse(OneShotPlaybackState.shouldApplyCompletionResolution(
++            completionRevision: completionRevision,
++            currentPlaybackRevision: sameIDNewSessionRevision
++        ))
++    }
++}
+

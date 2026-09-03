@@ -405,7 +405,7 @@ enum TransitionMatcher {
     /// Rebuild graph edges from fingerprints. Returns total link count written.
     @discardableResult
     static func rebuildAutoLinks(in state: inout LibraryState) -> Int {
-        let clips = state.clips
+        let clips = state.clips.filter { !$0.isCursorInteractionMaterial }
         guard clips.count >= 2 else {
             for i in state.clips.indices {
                 state.clips[i].nextClipIDs = []
@@ -415,8 +415,8 @@ enum TransitionMatcher {
         let threshold = state.autoLinkThreshold
         var total = 0
 
-        for i in clips.indices {
-            let from = clips[i]
+        for i in state.clips.indices where !state.clips[i].isCursorInteractionMaterial {
+            let from = state.clips[i]
             var scored: [(id: String, score: Double)] = []
             for other in clips where other.id != from.id {
                 let score = FrameFingerprint.similarity(from.lastFingerprint, other.firstFingerprint)
@@ -427,6 +427,9 @@ enum TransitionMatcher {
             scored.sort { $0.score > $1.score }
             state.clips[i].nextClipIDs = scored.map(\.id)
             total += scored.count
+        }
+        for i in state.clips.indices where state.clips[i].isCursorInteractionMaterial {
+            state.clips[i].nextClipIDs = []
         }
         return total
     }

@@ -1,20 +1,43 @@
 import AppKit
+import DesktopPetCore
 import ImageIO
 import UniformTypeIdentifiers
 
 @MainActor
-final class LibraryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class LibraryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
+    private struct SettingsErrorAlert: Equatable {
+        let title: String
+        let message: String
+    }
+
     private let store: LibraryStore
     private let engine: PlaylistEngine
 
     private let table = NSTableView()
     private let detail = DetailPanel()
     private let countLabel = NSTextField(labelWithString: "共 0 个片段")
+    private let tabControl = NSSegmentedControl(
+        labels: ["猫猫", "鼠标互动目标素材"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let playSelectedButton = NSButton(title: "按所选播放", target: nil, action: nil)
+    private let clearQueueButton = NSButton(title: "清除队列", target: nil, action: nil)
+    private let rebuildLinksButton = NSButton(title: "重算衔接", target: nil, action: nil)
     private let modePopup = NSPopUpButton()
     private let scaleSlider = NSSlider()
     private let topToggle = NSButton(checkboxWithTitle: "置顶", target: nil, action: nil)
     private let clickToggle = NSButton(checkboxWithTitle: "点击穿透", target: nil, action: nil)
     private let launchAtLoginToggle = NSButton(checkboxWithTitle: "开机启动", target: nil, action: nil)
+    private let preventIdleDisplaySleepToggle = NSButton(
+        checkboxWithTitle: "阻止自动锁屏与关闭屏幕",
+        target: nil,
+        action: nil
+    )
+    private let manicIdleDelayPopup = NSPopUpButton()
+    private let manicScaleSlider = NSSlider()
+    private let manicScaleValueLabel = NSTextField(labelWithString: "2.0×")
     private let autoLinkToggle = NSButton(checkboxWithTitle: "自动衔接", target: nil, action: nil)
     private let thresholdSlider = NSSlider()
     private let teleportToggle = NSButton(checkboxWithTitle: "随机隐现", target: nil, action: nil)
@@ -24,6 +47,17 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     private let progressOverlay = ProgressOverlay()
     private var isImporting = false
     private var suppressSelectionSideEffects = false
+    private var selectedTab: ClipLibraryTab = .cats
+    private var settingsErrorQueue: [SettingsErrorAlert] = []
+    private var activeSettingsError: SettingsErrorAlert?
+
+    private var visibleClips: [PetClip] {
+        store.state.clips.filter { $0.libraryTab == selectedTab }
+    }
+
+    private var visibleClipIDs: [String] {
+        visibleClips.map(\.id)
+    }
 
     init(store: LibraryStore, engine: PlaylistEngine) {
         self.store = store
@@ -39,6 +73,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 760, height: 520)
         super.init(window: window)
+        window.delegate = self
 
         buildUI()
         reload()
@@ -60,6 +95,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    func windowWillClose(_ notification: Notification) {
+        detail.stopPreviews()
+    }
 
     private func buildUI() {
         guard let content = window?.contentView else { return }
@@ -132,14 +171,17 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         upBtn.bezelStyle = .rounded
         let downBtn = NSButton(title: "下移", target: self, action: #selector(moveSelectionDown))
         downBtn.bezelStyle = .rounded
-        let playBtn = NSButton(title: "按所选播放", target: self, action: #selector(playSelectedQueue))
-        playBtn.bezelStyle = .rounded
-        let clearQueueBtn = NSButton(title: "清除队列", target: self, action: #selector(clearPlayQueue))
-        clearQueueBtn.bezelStyle = .rounded
+        playSelectedButton.target = self
+        playSelectedButton.action = #selector(playSelectedQueue)
+        playSelectedButton.bezelStyle = .rounded
+        clearQueueButton.target = self
+        clearQueueButton.action = #selector(clearPlayQueue)
+        clearQueueButton.bezelStyle = .rounded
         let deleteBtn = NSButton(title: "删除", target: self, action: #selector(deleteSelected))
         deleteBtn.bezelStyle = .rounded
-        let rebuildBtn = NSButton(title: "重算衔接", target: self, action: #selector(rebuildLinks))
-        rebuildBtn.bezelStyle = .rounded
+        rebuildLinksButton.target = self
+        rebuildLinksButton.action = #selector(rebuildLinks)
+        rebuildLinksButton.bezelStyle = .rounded
         let exportBtn = NSButton(title: "导出 GIF…", target: self, action: #selector(exportSelectedClip))
         exportBtn.bezelStyle = .rounded
         countLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -150,10 +192,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         row.addArrangedSubview(clearSelBtn)
         row.addArrangedSubview(upBtn)
         row.addArrangedSubview(downBtn)
-        row.addArrangedSubview(playBtn)
-        row.addArrangedSubview(clearQueueBtn)
+        row.addArrangedSubview(playSelectedButton)
+        row.addArrangedSubview(clearQueueButton)
         row.addArrangedSubview(deleteBtn)
-        row.addArrangedSubview(rebuildBtn)
+        row.addArrangedSubview(rebuildLinksButton)
         row.addArrangedSubview(exportBtn)
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(countLabel)
@@ -192,6 +234,11 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         listHeader.textColor = .secondaryLabelColor
         listHeader.translatesAutoresizingMaskIntoConstraints = false
 
+        tabControl.translatesAutoresizingMaskIntoConstraints = false
+        tabControl.selectedSegment = selectedTab.rawValue
+        tabControl.target = self
+        tabControl.action = #selector(libraryTabChanged)
+
         let scroll = NSScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.hasVerticalScroller = true
@@ -222,13 +269,18 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         table.intercellSpacing = NSSize(width: 0, height: 4)
 
         listPane.addSubview(listHeader)
+        listPane.addSubview(tabControl)
         listPane.addSubview(scroll)
         NSLayoutConstraint.activate([
             listHeader.topAnchor.constraint(equalTo: listPane.topAnchor, constant: 10),
             listHeader.leadingAnchor.constraint(equalTo: listPane.leadingAnchor, constant: 12),
             listHeader.trailingAnchor.constraint(equalTo: listPane.trailingAnchor, constant: -8),
 
-            scroll.topAnchor.constraint(equalTo: listHeader.bottomAnchor, constant: 6),
+            tabControl.topAnchor.constraint(equalTo: listHeader.bottomAnchor, constant: 6),
+            tabControl.leadingAnchor.constraint(equalTo: listPane.leadingAnchor, constant: 10),
+            tabControl.trailingAnchor.constraint(equalTo: listPane.trailingAnchor, constant: -10),
+
+            scroll.topAnchor.constraint(equalTo: tabControl.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: listPane.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: listPane.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: listPane.bottomAnchor)
@@ -248,7 +300,8 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             self.detail.show(
                 clip: self.store.clip(id: clipID),
                 all: self.store.state.clips,
-                threshold: self.store.state.autoLinkThreshold
+                threshold: self.store.state.autoLinkThreshold,
+                globalScale: self.store.state.petScale
             )
         }
         detail.onRename = { [weak self] clipID, newName in
@@ -261,6 +314,20 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             guard let self else { return }
             self.store.toggleTag(clipID: clipID, tag: tag)
             NotificationCenter.default.post(name: .libraryDidChange, object: nil)
+        }
+        detail.onToggleCursorPrey = { [weak self] clipID, enabled in
+            self?.updateCursorInteractionRole(clipID: clipID, isPrey: true, enabled: enabled)
+        }
+        detail.onToggleCursorInteraction = { [weak self] clipID, enabled in
+            self?.updateCursorInteractionRole(clipID: clipID, isPrey: false, enabled: enabled)
+        }
+        detail.onCursorPreyDisplaySizeChanged = { [weak self] clipID, displaySize in
+            self?.store.setCursorPreyDisplaySize(clipID: clipID, displaySize: displaySize)
+        }
+        detail.onClipScaleChanged = { [weak self] clipID, scale in
+            guard let self else { return }
+            self.store.setClipScale(clipID: clipID, scale: scale)
+            NotificationCenter.default.post(name: .petPresentationDidChange, object: nil)
         }
 
         body.addSubview(listPane)
@@ -379,6 +446,46 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         row3.addArrangedSubview(editRemindersButton)
         row3.addArrangedSubview(NSView())
 
+        let row4 = NSStackView()
+        row4.orientation = .horizontal
+        row4.spacing = 12
+        preventIdleDisplaySleepToggle.target = self
+        preventIdleDisplaySleepToggle.action = #selector(idlePresentationSettingsChanged)
+        let idleDelayLabel = NSTextField(labelWithString: "空闲后放大")
+        manicIdleDelayPopup.removeAllItems()
+        let idleDelayOptions: [(title: String, seconds: TimeInterval?)] = [
+            ("关闭", nil),
+            ("1 分钟", 60),
+            ("3 分钟", 180),
+            ("5 分钟", 300),
+            ("10 分钟", 600),
+            ("15 分钟", 900),
+            ("30 分钟", 1800)
+        ]
+        for option in idleDelayOptions {
+            manicIdleDelayPopup.addItem(withTitle: option.title)
+            manicIdleDelayPopup.lastItem?.representedObject = option.seconds.map(NSNumber.init(value:))
+                ?? NSNull()
+        }
+        manicIdleDelayPopup.target = self
+        manicIdleDelayPopup.action = #selector(idlePresentationSettingsChanged)
+        let manicScaleLabel = NSTextField(labelWithString: "魔性倍率")
+        manicScaleSlider.minValue = IdlePresentationPolicy.minimumManicScale
+        manicScaleSlider.maxValue = IdlePresentationPolicy.maximumManicScale
+        manicScaleSlider.doubleValue = store.state.manicScale
+        manicScaleSlider.target = self
+        manicScaleSlider.action = #selector(idlePresentationSettingsChanged)
+        manicScaleSlider.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        manicScaleValueLabel.alignment = .right
+        manicScaleValueLabel.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        row4.addArrangedSubview(preventIdleDisplaySleepToggle)
+        row4.addArrangedSubview(idleDelayLabel)
+        row4.addArrangedSubview(manicIdleDelayPopup)
+        row4.addArrangedSubview(manicScaleLabel)
+        row4.addArrangedSubview(manicScaleSlider)
+        row4.addArrangedSubview(manicScaleValueLabel)
+        row4.addArrangedSubview(NSView())
+
         let launchHint = NSTextField(wrappingLabelWithString: "「开机启动」会在登录时自动打开桌面宠物。若提示需要批准，请到 系统设置 → 通用 → 登录项 中允许。")
         launchHint.textColor = .secondaryLabelColor
         launchHint.font = .systemFont(ofSize: 11)
@@ -387,6 +494,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         col.addArrangedSubview(row1)
         col.addArrangedSubview(row2)
         col.addArrangedSubview(row3)
+        col.addArrangedSubview(row4)
         col.addArrangedSubview(launchHint)
         wrap.addSubview(col)
 
@@ -400,7 +508,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             col.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -12),
             col.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -10),
 
-            wrap.heightAnchor.constraint(equalToConstant: 150)
+            wrap.heightAnchor.constraint(equalToConstant: 184)
         ])
         return wrap
     }
@@ -413,19 +521,22 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             selectedIDs = selectedClip().map { [$0.id] } ?? []
         }
 
-        let count = store.state.clips.count
+        let totalCount = store.state.clips.count
+        let count = visibleClips.count
         let selectedCount = table.numberOfSelectedRows
-        let queueCount = store.state.activeQueue.count
-        let queueText = queueCount > 0 ? " · 队列 \(queueCount)" : ""
-        countLabel.stringValue = "已选 \(max(selectedCount, selectedIDs.count)) / 共 \(count)\(queueText)"
-        window?.title = "桌面宠物 · 片段库（\(count)）"
+        let activeQueue = filteredActiveQueueIDs()
+        let hasActiveQueue = !store.state.activeQueue.isEmpty
+        let queueCount = activeQueue.count
+        let queueText = hasActiveQueue ? " · 队列 \(queueCount)" : ""
+        countLabel.stringValue = "已选 \(max(selectedCount, selectedIDs.count)) / 本页 \(count) · 全部 \(totalCount)\(queueText)"
+        window?.title = "桌面宠物 · 片段库（\(totalCount)）"
 
         suppressSelectionSideEffects = true
         table.reloadData()
         if !selectedIDs.isEmpty {
             var indices = IndexSet()
             for id in selectedIDs {
-                if let idx = store.state.clips.firstIndex(where: { $0.id == id }) {
+                if let idx = visibleClips.firstIndex(where: { $0.id == id }) {
                     indices.insert(idx)
                 }
             }
@@ -433,10 +544,17 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         }
         suppressSelectionSideEffects = false
 
+        tabControl.selectedSegment = selectedTab.rawValue
+        let isCatTab = selectedTab == .cats
+        playSelectedButton.isEnabled = isCatTab
+        clearQueueButton.isEnabled = isCatTab
+        rebuildLinksButton.isEnabled = isCatTab
+
         modePopup.selectItem(at: PlaybackMode.allCases.firstIndex(of: store.state.playbackMode) ?? 0)
         topToggle.state = store.state.alwaysOnTop ? .on : .off
         clickToggle.state = store.state.clickThrough ? .on : .off
         launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
+        refreshIdlePresentationControls()
         autoLinkToggle.state = store.state.autoLinkEnabled ? .on : .off
         scaleSlider.doubleValue = store.state.petScale
         thresholdSlider.doubleValue = store.state.autoLinkThreshold
@@ -463,11 +581,19 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     private func updateCountLabel() {
-        let count = store.state.clips.count
+        let count = visibleClips.count
+        let totalCount = store.state.clips.count
         let selectedCount = table.selectedRowIndexes.count
-        let queueCount = store.state.activeQueue.count
-        let queueText = queueCount > 0 ? " · 队列 \(queueCount)" : " · 播放全部"
-        countLabel.stringValue = "已选 \(selectedCount) / 共 \(count)\(queueText)"
+        let activeQueue = filteredActiveQueueIDs()
+        let hasActiveQueue = !store.state.activeQueue.isEmpty
+        let queueCount = activeQueue.count
+        let queueText: String
+        if selectedTab == .cursorTargets {
+            queueText = " · 互动目标"
+        } else {
+            queueText = hasActiveQueue ? " · 队列 \(queueCount)" : " · 播放全部"
+        }
+        countLabel.stringValue = "已选 \(selectedCount) / 本页 \(count) · 全部 \(totalCount)\(queueText)"
         countLabel.textColor = .secondaryLabelColor
     }
 
@@ -491,14 +617,21 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     private func selectedClips() -> [PetClip] {
-        table.selectedRowIndexes.sorted().compactMap { row in
-            guard row >= 0, row < store.state.clips.count else { return nil }
-            return store.state.clips[row]
+        let clips = visibleClips
+        return table.selectedRowIndexes.sorted().compactMap { row -> PetClip? in
+            guard row >= 0, row < clips.count else { return nil }
+            return clips[row]
         }
     }
 
     private func selectClip(id: String) {
-        guard let idx = store.state.clips.firstIndex(where: { $0.id == id }) else { return }
+        guard let clip = store.clip(id: id) else { return }
+        if selectedTab != clip.libraryTab {
+            selectedTab = clip.libraryTab
+            tabControl.selectedSegment = selectedTab.rawValue
+            table.reloadData()
+        }
+        guard let idx = visibleClips.firstIndex(where: { $0.id == id }) else { return }
         suppressSelectionSideEffects = true
         table.selectRowIndexes(IndexSet(integer: idx), byExtendingSelection: false)
         table.scrollRowToVisible(idx)
@@ -508,15 +641,59 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     private func showSelectedDetail() {
+        guard window?.isVisible == true else {
+            detail.stopPreviews()
+            return
+        }
         let selected = selectedClips()
         if selected.count > 1 {
-            detail.showMultiple(selected: selected, queue: store.state.activeQueue)
+            detail.showMultiple(selected: selected, queue: filteredActiveQueueIDs())
         } else {
-            detail.show(clip: selected.first, all: store.state.clips, threshold: store.state.autoLinkThreshold)
+            detail.show(
+                clip: selected.first,
+                all: store.state.clips,
+                threshold: store.state.autoLinkThreshold,
+                globalScale: store.state.petScale
+            )
         }
     }
 
+    private func filteredActiveQueueIDs() -> [String] {
+        guard !store.state.activeQueue.isEmpty else { return [] }
+        return store.state.activeQueue.filter { id in
+            store.clip(id: id)?.isCursorInteractionMaterial == false
+        }
+    }
+
+    private func updateCursorInteractionRole(clipID: String, isPrey: Bool, enabled: Bool) {
+        if isPrey {
+            store.setCursorPreyEnabled(clipID: clipID, enabled: enabled)
+        } else {
+            store.setCursorInteractionEnabled(clipID: clipID, enabled: enabled)
+        }
+
+        if let clip = store.clip(id: clipID) {
+            selectedTab = clip.libraryTab
+            tabControl.selectedSegment = selectedTab.rawValue
+        }
+        // App-wide library synchronization corrects the playback target and
+        // refreshes the list/detail exactly once for this role mutation.
+        NotificationCenter.default.post(name: .libraryDidChange, object: nil)
+        reload()
+        selectClip(id: clipID)
+    }
+
     // MARK: Actions
+
+    @objc private func libraryTabChanged() {
+        guard let tab = ClipLibraryTab(rawValue: tabControl.selectedSegment) else { return }
+        detail.stopPreviews()
+        selectedTab = tab
+        reload()
+        if let firstID = visibleClips.first?.id {
+            selectClip(id: firstID)
+        }
+    }
 
     @objc private func selectAllClips() {
         suppressSelectionSideEffects = true
@@ -535,12 +712,19 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     @objc private func moveSelectionUp() {
-        let indices = table.selectedRowIndexes
-        guard !indices.isEmpty else { return }
-        let next = store.moveClipsUp(at: indices)
+        let selectedIDs = selectedClips().map(\.id)
+        guard !selectedIDs.isEmpty else { return }
+        let nextIDs = store.moveVisibleClips(
+            ids: visibleClipIDs,
+            selectedIDs: selectedIDs,
+            direction: .up
+        )
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
         suppressSelectionSideEffects = true
         table.reloadData()
+        let next = IndexSet(nextIDs.compactMap { id in
+            visibleClips.firstIndex(where: { $0.id == id })
+        })
         table.selectRowIndexes(next, byExtendingSelection: false)
         if let first = next.first { table.scrollRowToVisible(first) }
         suppressSelectionSideEffects = false
@@ -549,12 +733,19 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     @objc private func moveSelectionDown() {
-        let indices = table.selectedRowIndexes
-        guard !indices.isEmpty else { return }
-        let next = store.moveClipsDown(at: indices)
+        let selectedIDs = selectedClips().map(\.id)
+        guard !selectedIDs.isEmpty else { return }
+        let nextIDs = store.moveVisibleClips(
+            ids: visibleClipIDs,
+            selectedIDs: selectedIDs,
+            direction: .down
+        )
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
         suppressSelectionSideEffects = true
         table.reloadData()
+        let next = IndexSet(nextIDs.compactMap { id in
+            visibleClips.firstIndex(where: { $0.id == id })
+        })
         table.selectRowIndexes(next, byExtendingSelection: false)
         if let last = next.max() { table.scrollRowToVisible(last) }
         suppressSelectionSideEffects = false
@@ -563,9 +754,24 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     @objc private func playSelectedQueue() {
+        guard selectedTab == .cats else { return }
         let selected = selectedClips()
         guard !selected.isEmpty else { return }
-        let ids = selected.map(\.id)
+        let ids = selected
+            .filter { !$0.isCursorInteractionMaterial }
+            .map(\.id)
+        guard !ids.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "无法创建播放队列"
+            alert.informativeText = "所选片段都是鼠标互动专用素材，不能参与普通播放。"
+            alert.addButton(withTitle: "好")
+            if let window {
+                alert.beginSheetModal(for: window) { _ in }
+            } else {
+                alert.runModal()
+            }
+            return
+        }
         store.setActiveQueue(ids)
         // Keep the user's current playback mode (sequential / random / graph).
         engine.playFromQueueStart()
@@ -574,6 +780,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     @objc private func clearPlayQueue() {
+        guard selectedTab == .cats else { return }
         store.clearActiveQueue()
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
         reload(preservingSelection: true)
@@ -620,7 +827,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
 
                     // Preview & tune chromakey before committing.
                     let preview = ChromaKeyPreviewController(staging: staging)
-                    guard let settings = await preview.runModal(for: self.window!),
+                    guard let previewResult = await preview.runModal(for: self.window!),
                           let parentWindow = self.window else {
                         self.store.discardStaging(staging)
                         continue
@@ -634,12 +841,20 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
                     )
                     self.updateImportOverlay()
 
-                    if let clip = await self.store.commitImport(staging: staging, settings: settings) {
+                    if let clip = await self.store.commitImport(
+                        staging: staging,
+                        settings: previewResult.settings,
+                        materialType: previewResult.materialType
+                    ) {
                         importedCount += 1
                         lastID = clip.id
+                        self.selectedTab = clip.libraryTab
+                        self.tabControl.selectedSegment = clip.libraryTab.rawValue
                         self.reload()
                         self.selectClip(id: clip.id)
-                        self.engine.playClip(id: clip.id)
+                        if clip.libraryTab == .cats {
+                            self.engine.playClip(id: clip.id)
+                        }
                         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
                     } else {
                         self.reload()
@@ -715,6 +930,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     }
 
     @objc private func rebuildLinks() {
+        guard selectedTab == .cats else { return }
         let linkCount = store.rebuildAutoLinks()
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
         reload(preservingSelection: true)
@@ -780,6 +996,79 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
     }
 
+    @objc private func idlePresentationSettingsChanged() {
+        let delay = (manicIdleDelayPopup.selectedItem?.representedObject as? NSNumber)?.doubleValue
+        let previousLastError = store.lastError
+        let saveError = store.update {
+            $0.preventIdleDisplaySleep = preventIdleDisplaySleepToggle.state == .on
+            $0.manicIdleDelay = delay
+            $0.manicScale = IdlePresentationPolicy.clampedManicScale(manicScaleSlider.doubleValue)
+        }
+        manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
+        manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
+        if let saveError {
+            if previousLastError == nil {
+                store.consumeLastError(ifMatching: saveError)
+            }
+            presentIdleSettingsSaveError(saveError)
+        }
+        NotificationCenter.default.post(name: .idlePresentationSettingsDidChange, object: nil)
+    }
+
+    func refreshIdlePresentationControls() {
+        preventIdleDisplaySleepToggle.state = store.state.preventIdleDisplaySleep ? .on : .off
+        let selectedDelayIndex = manicIdleDelayPopup.itemArray.firstIndex { item in
+            if let representedDelay = item.representedObject as? NSNumber,
+               let storedDelay = store.state.manicIdleDelay {
+                return representedDelay.doubleValue == storedDelay
+            }
+            return item.representedObject is NSNull && store.state.manicIdleDelay == nil
+        }
+        if let selectedDelayIndex {
+            manicIdleDelayPopup.selectItem(at: selectedDelayIndex)
+        }
+        manicScaleSlider.doubleValue = store.state.manicScale
+        manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
+        manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
+    }
+
+    func presentIdleSettingsSaveError(_ message: String) {
+        enqueueSettingsError(
+            title: "保存设置失败",
+            message: "本次运行中已生效，但未写入磁盘，重启后可能恢复旧值。\n\n\(message)"
+        )
+    }
+
+    func presentIdleDisplaySleepError(_ message: String) {
+        enqueueSettingsError(title: "无法阻止自动关闭屏幕", message: message)
+    }
+
+    private func enqueueSettingsError(title: String, message: String) {
+        let item = SettingsErrorAlert(title: title, message: message)
+        guard activeSettingsError != item, !settingsErrorQueue.contains(item) else { return }
+        settingsErrorQueue.append(item)
+        presentNextSettingsError()
+    }
+
+    private func presentNextSettingsError() {
+        guard activeSettingsError == nil, !settingsErrorQueue.isEmpty else { return }
+        let item = settingsErrorQueue.removeFirst()
+        activeSettingsError = item
+        let alert = NSAlert()
+        alert.messageText = item.title
+        alert.informativeText = item.message
+        if let window, window.isVisible {
+            alert.beginSheetModal(for: window) { [weak self] _ in
+                self?.activeSettingsError = nil
+                self?.presentNextSettingsError()
+            }
+        } else {
+            alert.runModal()
+            activeSettingsError = nil
+            presentNextSettingsError()
+        }
+    }
+
     @objc private func autoLinkChanged() {
         store.update { $0.autoLinkEnabled = autoLinkToggle.state == .on }
         if store.state.autoLinkEnabled {
@@ -841,11 +1130,13 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     // MARK: Table
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        store.state.clips.count
+        visibleClips.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let clip = store.state.clips[row]
+        let clips = visibleClips
+        guard row >= 0, row < clips.count else { return nil }
+        let clip = clips[row]
         let id = NSUserInterfaceItemIdentifier("clipCell")
         let cell = (tableView.makeView(withIdentifier: id, owner: nil) as? ClipTableCellView) ?? {
             let c = ClipTableCellView()
@@ -853,9 +1144,18 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             return c
         }()
 
-        let title = clip.displayTitle(indexInLibrary: row)
+        let libraryIndex = store.state.clips.firstIndex(where: { $0.id == clip.id }) ?? row
+        let title = clip.displayTitle(indexInLibrary: libraryIndex)
         let playing = engine.currentClipID == clip.id
-        let queueIndex = store.state.activeQueue.firstIndex(of: clip.id).map { $0 + 1 }
+        let queueIndex = filteredActiveQueueIDs().firstIndex(of: clip.id).map { $0 + 1 }
+        let interactionRole: String?
+        if clip.tags.contains(ClipTag.cursorPrey) {
+            interactionRole = "互动目标 · 不参与普通播放"
+        } else if clip.tags.contains(ClipTag.cursorInteraction) {
+            interactionRole = "互动猫片段 · 不参与普通播放"
+        } else {
+            interactionRole = nil
+        }
         cell.configure(
             title: title,
             meta: clip.metaText,
@@ -863,6 +1163,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             firstFrame: AppPaths.frameURL(clipID: clip.id, index: 1),
             lastFrame: AppPaths.frameURL(clipID: clip.id, index: max(1, clip.frameCount)),
             queueIndex: queueIndex,
+            interactionRole: interactionRole,
             isPlaying: playing
         )
         cell.toolTip = "\(title)\n导入：\(clip.importedAtText)\n\(clip.frameCount) 帧 · \(String(format: "%.1f", clip.duration)) 秒\n播放 \(clip.playCount) 次"
@@ -973,6 +1274,7 @@ final class ClipTableCellView: NSTableCellView {
         firstFrame: URL,
         lastFrame: URL,
         queueIndex: Int?,
+        interactionRole: String?,
         isPlaying: Bool
     ) {
         titleLabel.stringValue = title + (isPlaying ? "  ▶" : "")
@@ -981,8 +1283,12 @@ final class ClipTableCellView: NSTableCellView {
         firstThumb.image = ThumbnailCache.shared.image(at: firstFrame)
         lastThumb.image = ThumbnailCache.shared.image(at: lastFrame)
 
-        if let queueIndex {
-            badgeLabel.stringValue = "队列 #\(queueIndex)"
+        let badges = [
+            queueIndex.map { "队列 #\($0)" },
+            interactionRole
+        ].compactMap { $0 }
+        if !badges.isEmpty {
+            badgeLabel.stringValue = badges.joined(separator: " · ")
             badgeLabel.isHidden = false
         } else {
             badgeLabel.stringValue = ""
@@ -1038,13 +1344,22 @@ final class DetailPanel: NSView {
     var onToggleNext: ((String, String, Bool) -> Void)?
     var onRename: ((String, String) -> Void)?
     var onToggleTag: ((String, String) -> Void)?
+    var onToggleCursorPrey: ((String, Bool) -> Void)?
+    var onToggleCursorInteraction: ((String, Bool) -> Void)?
+    var onCursorPreyDisplaySizeChanged: ((String, Double) -> Void)?
+    var onClipScaleChanged: ((String, Double) -> Void)?
 
     private let scroll = NSScrollView()
     private let stack = NSStackView()
     private let documentView = FlippedClipView()
     private let preview = ClipPreviewPlayer()
+    private let cursorPreyPreview = CursorPreyPreview()
     private var clipID: String?
     private var shownClipID: String?
+    private var globalScale = 1.0
+    private weak var clipScaleSlider: NSSlider?
+    private weak var clipScaleValueLabel: NSTextField?
+    private weak var clipEffectiveScaleLabel: NSTextField?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1088,7 +1403,7 @@ final class DetailPanel: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    func show(clip: PetClip?, all: [PetClip], threshold: Double) {
+    func show(clip: PetClip?, all: [PetClip], threshold: Double, globalScale: Double) {
         // Keep scroll position when refreshing the same clip's link toggles.
         let keepScroll = (clip?.id != nil && clip?.id == shownClipID)
         let oldOrigin = scroll.contentView.bounds.origin
@@ -1096,6 +1411,7 @@ final class DetailPanel: NSView {
         clearStack()
         clipID = clip?.id
         shownClipID = clip?.id
+        self.globalScale = globalScale
 
         guard let clip else {
             let empty = NSTextField(wrappingLabelWithString: all.isEmpty
@@ -1142,8 +1458,16 @@ final class DetailPanel: NSView {
         }
     }
 
-    private func clearStack() {
+    func stopPreviews() {
         preview.stop()
+        cursorPreyPreview.stop()
+    }
+
+    private func clearStack() {
+        stopPreviews()
+        clipScaleSlider = nil
+        clipScaleValueLabel = nil
+        clipEffectiveScaleLabel = nil
         stack.arrangedSubviews.forEach {
             stack.removeArrangedSubview($0)
             $0.removeFromSuperview()
@@ -1187,9 +1511,42 @@ final class DetailPanel: NSView {
         pettingToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
         stack.addArrangedSubview(pettingToggle)
 
-        // Full-motion preview of the keyed frame sequence.
-        stack.addArrangedSubview(preview)
-        preview.load(clip: clip)
+        let cursorPreyToggle = NSButton(
+            checkboxWithTitle: "鼠标互动目标素材",
+            target: self,
+            action: #selector(toggleCursorPrey(_:))
+        )
+        cursorPreyToggle.state = clip.tags.contains(ClipTag.cursorPrey) ? .on : .off
+        cursorPreyToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
+        stack.addArrangedSubview(cursorPreyToggle)
+
+        let cursorInteractionToggle = NSButton(
+            checkboxWithTitle: "鼠标互动猫片段",
+            target: self,
+            action: #selector(toggleCursorInteraction(_:))
+        )
+        cursorInteractionToggle.state = clip.tags.contains(ClipTag.cursorInteraction) ? .on : .off
+        cursorInteractionToggle.identifier = NSUserInterfaceItemIdentifier(clip.id)
+        stack.addArrangedSubview(cursorInteractionToggle)
+
+        let cursorInteractionHint = NSTextField(wrappingLabelWithString: "两类鼠标互动专用素材都不会参与普通播放、播放队列或自动衔接；两种角色互斥。")
+        cursorInteractionHint.textColor = .secondaryLabelColor
+        cursorInteractionHint.font = .systemFont(ofSize: 11)
+        cursorInteractionHint.preferredMaxLayoutWidth = 420
+        stack.addArrangedSubview(cursorInteractionHint)
+
+        if clip.tags.contains(ClipTag.cursorPrey) {
+            appendCursorPreyEditor(clip: clip)
+        } else {
+            appendClipScaleEditor(clip: clip)
+        }
+
+        // Ordinary clips retain the existing full-motion preview. Prey clips
+        // use the focused point-size preview added above instead.
+        if !clip.tags.contains(ClipTag.cursorPrey) {
+            stack.addArrangedSubview(preview)
+            preview.load(clip: clip)
+        }
 
         let frames = NSStackView()
         frames.orientation = .horizontal
@@ -1198,6 +1555,8 @@ final class DetailPanel: NSView {
         frames.addArrangedSubview(frameThumb(url: AppPaths.frameURL(clipID: clip.id, index: 1), caption: "首帧"))
         frames.addArrangedSubview(frameThumb(url: AppPaths.frameURL(clipID: clip.id, index: max(1, clip.frameCount)), caption: "尾帧"))
         stack.addArrangedSubview(frames)
+
+        guard !clip.isCursorInteractionMaterial else { return }
 
         let section = NSTextField(labelWithString: "可衔接的下一段")
         section.font = .boldSystemFont(ofSize: 13)
@@ -1209,7 +1568,7 @@ final class DetailPanel: NSView {
         hint.preferredMaxLayoutWidth = 420
         stack.addArrangedSubview(hint)
 
-        for other in all where other.id != clip.id {
+        for other in all where other.id != clip.id && !other.isCursorInteractionMaterial {
             let otherIndex = all.firstIndex(where: { $0.id == other.id }) ?? 0
             let score = TransitionMatcher.score(from: clip, to: other)
             let row = NSStackView()
@@ -1234,6 +1593,95 @@ final class DetailPanel: NSView {
             row.addArrangedSubview(NSView())
             stack.addArrangedSubview(row)
         }
+    }
+
+    private func appendCursorPreyEditor(clip: PetClip) {
+        let settings = clip.cursorPreySettings ?? CursorPreySettings()
+        let section = NSTextField(labelWithString: "互动目标大小")
+        section.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(section)
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+
+        let slider = NSSlider()
+        slider.minValue = CursorInteractionPolicy.minimumPreyDisplaySize
+        slider.maxValue = CursorInteractionPolicy.maximumPreyDisplaySize
+        slider.doubleValue = settings.displaySize
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(cursorPreySizeChanged(_:))
+        slider.identifier = NSUserInterfaceItemIdentifier(clip.id)
+        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
+
+        let sizeLabel = NSTextField(labelWithString: Self.preySizeText(settings.displaySize))
+        sizeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        sizeLabel.identifier = NSUserInterfaceItemIdentifier("cursorPreySizeLabel")
+
+        let resetButton = NSButton(title: "恢复默认", target: self, action: #selector(resetCursorPreySize(_:)))
+        resetButton.bezelStyle = .rounded
+        resetButton.identifier = NSUserInterfaceItemIdentifier(clip.id)
+
+        row.addArrangedSubview(slider)
+        row.addArrangedSubview(sizeLabel)
+        row.addArrangedSubview(resetButton)
+        stack.addArrangedSubview(row)
+
+        stack.addArrangedSubview(cursorPreyPreview)
+        cursorPreyPreview.load(clip: clip, displaySize: settings.displaySize)
+    }
+
+    private func appendClipScaleEditor(clip: PetClip) {
+        let section = NSTextField(labelWithString: "猫猫片段大小")
+        section.font = .boldSystemFont(ofSize: 13)
+        stack.addArrangedSubview(section)
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+
+        let slider = NSSlider()
+        slider.minValue = PetClipPresentationPolicy.minimumClipScale
+        slider.maxValue = PetClipPresentationPolicy.maximumClipScale
+        slider.doubleValue = clip.clipScale
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(clipScaleChanged(_:))
+        slider.identifier = NSUserInterfaceItemIdentifier(clip.id)
+        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
+
+        let valueLabel = NSTextField(labelWithString: Self.clipScaleText(clip.clipScale))
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+
+        let resetButton = NSButton(title: "恢复默认", target: self, action: #selector(resetClipScale(_:)))
+        resetButton.bezelStyle = .rounded
+        resetButton.identifier = NSUserInterfaceItemIdentifier(clip.id)
+
+        row.addArrangedSubview(slider)
+        row.addArrangedSubview(valueLabel)
+        row.addArrangedSubview(resetButton)
+        stack.addArrangedSubview(row)
+
+        let effectiveLabel = NSTextField(labelWithString: PetClipPresentationPolicy.scaleSummary(
+            clipScale: clip.clipScale,
+            globalScale: globalScale
+        ))
+        effectiveLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        effectiveLabel.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(effectiveLabel)
+
+        clipScaleSlider = slider
+        clipScaleValueLabel = valueLabel
+        clipEffectiveScaleLabel = effectiveLabel
+    }
+
+    private static func clipScaleText(_ scale: Double) -> String {
+        String(format: "%.2f×", PetClipPresentationPolicy.clampedClipScale(scale))
+    }
+
+    private static func preySizeText(_ displaySize: Double) -> String {
+        "\(Int(displaySize.rounded())) pt"
     }
 
     @objc private func renameCurrent(_ sender: NSButton) {
@@ -1281,6 +1729,212 @@ final class DetailPanel: NSView {
     @objc private func togglePettingTag(_ sender: NSButton) {
         guard let clipID = sender.identifier?.rawValue else { return }
         onToggleTag?(clipID, ClipTag.petting)
+    }
+
+    @objc private func toggleCursorPrey(_ sender: NSButton) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        onToggleCursorPrey?(clipID, sender.state == .on)
+    }
+
+    @objc private func toggleCursorInteraction(_ sender: NSButton) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        onToggleCursorInteraction?(clipID, sender.state == .on)
+    }
+
+    @objc private func clipScaleChanged(_ sender: NSSlider) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        let scale = PetClipPresentationPolicy.clampedClipScale(sender.doubleValue)
+        updateClipScaleEditor(scale)
+        onClipScaleChanged?(clipID, scale)
+    }
+
+    @objc private func resetClipScale(_ sender: NSButton) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        let scale = PetClipPresentationPolicy.defaultClipScale
+        updateClipScaleEditor(scale)
+        onClipScaleChanged?(clipID, scale)
+    }
+
+    private func updateClipScaleEditor(_ scale: Double) {
+        let value = PetClipPresentationPolicy.clampedClipScale(scale)
+        clipScaleSlider?.doubleValue = value
+        clipScaleValueLabel?.stringValue = Self.clipScaleText(value)
+        clipEffectiveScaleLabel?.stringValue = PetClipPresentationPolicy.scaleSummary(
+            clipScale: value,
+            globalScale: globalScale
+        )
+    }
+
+    @objc private func cursorPreySizeChanged(_ sender: NSSlider) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        let displaySize = CursorInteractionPolicy.clampedPreyDisplaySize(sender.doubleValue)
+        sender.doubleValue = displaySize
+        updateCursorPreySizeEditor(displaySize)
+        onCursorPreyDisplaySizeChanged?(clipID, displaySize)
+    }
+
+    @objc private func resetCursorPreySize(_ sender: NSButton) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        let displaySize = CursorInteractionPolicy.defaultPreyDisplaySize
+        updateCursorPreySizeEditor(displaySize)
+        onCursorPreyDisplaySizeChanged?(clipID, displaySize)
+    }
+
+    private func updateCursorPreySizeEditor(_ displaySize: Double) {
+        let value = CursorInteractionPolicy.clampedPreyDisplaySize(displaySize)
+        stack.arrangedSubviews.compactMap { $0 as? NSStackView }.forEach { row in
+            row.arrangedSubviews.compactMap { $0 as? NSSlider }
+                .first(where: { $0.identifier?.rawValue == clipID })?
+                .doubleValue = value
+            row.arrangedSubviews.compactMap { $0 as? NSTextField }
+                .first(where: { $0.identifier?.rawValue == "cursorPreySizeLabel" })?
+                .stringValue = Self.preySizeText(value)
+        }
+        cursorPreyPreview.setDisplaySize(value)
+    }
+}
+
+// MARK: - Cursor-prey size preview
+
+/// Shows the target at the exact point size used by the cursor overlay while
+/// keeping a stable checkerboard canvas around it for alpha inspection.
+@MainActor
+private final class CursorPreyPreview: NSView {
+    private let canvas = NSView()
+    private let imageView = NSImageView()
+    private var imageWidthConstraint: NSLayoutConstraint!
+    private var imageHeightConstraint: NSLayoutConstraint!
+    private var timer: Timer?
+    private var clipID: String?
+    private var frameCount = 1
+    private var fps = 24.0
+    private var currentFrame = 1
+    private var aspectRatio = 1.0
+    private var cache: [Int: NSImage] = [:]
+    private var cacheOrder: [Int] = []
+    private let cacheLimit = 40
+
+    private static let checkerboard: NSColor = {
+        let side: CGFloat = 16
+        let half = side / 2
+        let image = NSImage(size: NSSize(width: side, height: side))
+        image.lockFocus()
+        NSColor(calibratedWhite: 0.92, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: side, height: side).fill()
+        NSColor(calibratedWhite: 0.82, alpha: 1).setFill()
+        NSRect(x: 0, y: 0, width: half, height: half).fill()
+        NSRect(x: half, y: half, width: half, height: half).fill()
+        image.unlockFocus()
+        return NSColor(patternImage: image)
+    }()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setup() {
+        canvas.translatesAutoresizingMaskIntoConstraints = false
+        canvas.wantsLayer = true
+        canvas.layer?.backgroundColor = Self.checkerboard.cgColor
+        canvas.layer?.cornerRadius = 8
+        canvas.layer?.masksToBounds = true
+        canvas.layer?.borderWidth = 0.5
+        canvas.layer?.borderColor = NSColor.separatorColor.cgColor
+        addSubview(canvas)
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.imageScaling = .scaleAxesIndependently
+        canvas.addSubview(imageView)
+        imageWidthConstraint = imageView.widthAnchor.constraint(equalToConstant: CursorInteractionPolicy.defaultPreyDisplaySize)
+        imageHeightConstraint = imageView.heightAnchor.constraint(equalToConstant: CursorInteractionPolicy.defaultPreyDisplaySize)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 260),
+            canvas.topAnchor.constraint(equalTo: topAnchor),
+            canvas.leadingAnchor.constraint(equalTo: leadingAnchor),
+            canvas.widthAnchor.constraint(equalToConstant: 240),
+            canvas.heightAnchor.constraint(equalToConstant: 180),
+            canvas.bottomAnchor.constraint(equalTo: bottomAnchor),
+            imageView.centerXAnchor.constraint(equalTo: canvas.centerXAnchor),
+            imageView.centerYAnchor.constraint(equalTo: canvas.centerYAnchor),
+            imageWidthConstraint,
+            imageHeightConstraint
+        ])
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { stop() }
+    }
+
+    func load(clip: PetClip, displaySize: Double) {
+        stop()
+        clipID = clip.id
+        frameCount = max(1, clip.frameCount)
+        fps = clip.fps > 0 ? clip.fps : 24
+        aspectRatio = clip.displayWidth > 0 && clip.displayHeight > 0
+            ? Double(clip.displayWidth) / Double(clip.displayHeight)
+            : 1
+        cache.removeAll()
+        cacheOrder.removeAll()
+        currentFrame = 1
+        setDisplaySize(displaySize)
+        showFrame(1)
+        startPlaying()
+    }
+
+    func setDisplaySize(_ displaySize: Double) {
+        let longestSide = CGFloat(CursorInteractionPolicy.clampedPreyDisplaySize(displaySize))
+        let safeAspectRatio = max(aspectRatio, 0.0001)
+        if safeAspectRatio >= 1 {
+            imageWidthConstraint.constant = longestSide
+            imageHeightConstraint.constant = longestSide / safeAspectRatio
+        } else {
+            imageWidthConstraint.constant = longestSide * safeAspectRatio
+            imageHeightConstraint.constant = longestSide
+        }
+        layoutSubtreeIfNeeded()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func startPlaying() {
+        guard frameCount > 1 else { return }
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func tick() {
+        showFrame(currentFrame % frameCount + 1)
+    }
+
+    private func showFrame(_ index: Int) {
+        currentFrame = index
+        imageView.image = frameImage(at: index)
+    }
+
+    private func frameImage(at index: Int) -> NSImage? {
+        guard let clipID else { return nil }
+        if let image = cache[index] { return image }
+        guard let image = NSImage(contentsOf: AppPaths.frameURL(clipID: clipID, index: index)) else {
+            return nil
+        }
+        cache[index] = image
+        cacheOrder.append(index)
+        if cacheOrder.count > cacheLimit {
+            cache.removeValue(forKey: cacheOrder.removeFirst())
+        }
+        return image
     }
 }
 

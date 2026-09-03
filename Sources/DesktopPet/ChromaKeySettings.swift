@@ -1,4 +1,5 @@
 import Foundation
+import DesktopPetCore
 
 /// Tunable chromakey parameters used for preview + final export.
 struct ChromaKeySettings: Equatable, Sendable {
@@ -43,4 +44,9 @@ struct ImportStaging: Sendable {
     let localSourceURL: URL
     let clipDirectory: URL
     let duration: TimeInterval
+}
+
+struct ChromaKeyPreviewResult: Sendable {
+    let settings: ChromaKeySettings
+    let materialType: ClipImportMaterialType
 }

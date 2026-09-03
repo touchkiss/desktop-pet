@@ -1,0 +1,1270 @@
+# Task Group 5 Report: Teleport Interaction Orchestration and Cleanup
+
+## Status
+
+DONE
+
+Implemented OpenSpec tasks 5.1–5.6. The change is scoped to `TeleportController` plus a focused pure session state and its XCTest coverage. No commit was created, and no library UI, model/store, README, AppDelegate, PlaylistEngine, overlay controller, or OpenSpec artifact was modified by this task.
+
+## Implementation
+
+### Provenance and candidate preparation
+
+- Added explicit trip provenance in `TeleportController`.
+  - The clip-ending random trip is the only `.autonomous` source.
+  - effect preview, hotkey summon, pomodoro summon, and download summon all use `.explicit`.
+- Interaction eligibility is evaluated only after `resolveDestination()` has finalized the landing mode, and only for an autonomous `.cursorNudge` with no explicit arrival message.
+- Candidate filtering requires the appropriate role tag, positive frame count, finite positive fps, and positive render dimensions.
+- Prey and interaction clips are selected from their own random pools. Pairing excludes the selected prey ID from the cat-action draw, including defensive handling of malformed legacy clips carrying both tags.
+- Missing prey settings use `CursorPreySettings()` so preserved settings are used when present and the 48 pt default is used otherwise.
+
+### Shared landing orchestration
+
+- Classic appear and integrated swarm arrival now enter one shared landing-preparation path.
+- A pending interaction starts in the required order:
+  1. start the cursor-prey overlay and make its first frame visible;
+  2. replace the engine's clip-end hold with the interaction cat one-shot at frame 1;
+  3. consume `holdingEngine`, force the pet's frame-1 refresh, place the landing frame, then reveal/start the cat presentation.
+- Successful interaction presentation is synchronous after the forced refresh so even a valid one-frame action cannot finish before its first frame becomes the appearance frame.
+- Ordinary classic landings retain the existing 50 ms settling delay; ordinary swarm handoff remains immediate.
+- Overlay or one-shot start failure stops partial overlay state, restores the cursor, clears the pending session, releases the ordinary engine hold once, and leaves reminder fallback enabled.
+
+### Completion, suppression, and cleanup
+
+- Successful interaction start suppresses the normal random cursor reminder for that trip only. Missing candidates and initial start failures preserve the existing random/explicit bubble path.
+- The one-shot's normal completion callback invokes shared cleanup with playback restoration disabled. It stops the overlay and clears the session but issues no playback command; `PlaylistEngine` remains the owner of ordinary restoration.
+- Autonomous clip-ending teleports are blocked while the session is pending or active.
+- An explicit preview/summon can cancel a pending/active interaction first, restore ordinary playback when needed, and then begin its non-interactive trip.
+- One idempotent cleanup method is reached by drag/fling cancellation, hide, explicit replacement trip, overlay failure, invalid/deleted/retagged sources during `syncFromStore`, controller stop/app quit, swarm setup failure, and existing teleport cancellation.
+  - pending cleanup clears/stops only and never advances playback;
+  - active cleanup stops the overlay and calls `cancelOneShotAndRestore()` only while the engine reports an active one-shot;
+  - repeated cleanup receives no phase result and cannot restore playback twice.
+- `holdingEngine` is set only when the teleport declines an ordinary clip end, is consumed without advancing after successful `playHeldCursorInteraction`, and is released exactly once on ordinary/fallback/cancellation paths.
+
+## TDD Evidence
+
+### RED
+
+Test added first: `Tests/DesktopPetTests/CursorInteractionSessionStateTests.swift`.
+
+The initial sandboxed command was blocked before compilation by SwiftPM/user cache sandbox permissions, so it was not counted as RED. The command was rerun outside that filesystem sandbox with task-scoped caches:
+
+```text
+SWIFTPM_MODULECACHE_OVERRIDE=/tmp/cursor-prey-task5-swift-cache \
+CLANG_MODULE_CACHE_PATH=/tmp/cursor-prey-task5-clang-cache \
+swift test --filter CursorInteractionSessionStateTests
+```
+
+Expected failure observed before production state existed:
+
+```text
+error: cannot find 'CursorInteractionSessionState' in scope
+error: Build failed
+```
+
+### GREEN
+
+After adding `Sources/DesktopPetCore/CursorInteractionSessionState.swift`, the same focused command passed:
+
+```text
+Executed 6 tests, with 0 failures (0 unexpected)
+```
+
+The focused suite covers distinct pair preparation, same-ID rejection, pending-only activation, pending clear, active clear, repeated idempotent clear, and refusal to replace pending/active sessions.
+
+## Final Verification
+
+All verification commands used task-scoped Swift/Clang module caches because the default user cache is not writable in the managed environment.
+
+1. Focused state verification:
+
+```text
+swift test --filter CursorInteractionSessionStateTests
+Executed 6 tests, with 0 failures (0 unexpected)
+```
+
+2. Full suite:
+
+```text
+swift test
+Executed 49 tests, with 0 failures (0 unexpected)
+```
+
+3. Full debug build:
+
+```text
+swift build
+Build complete! (0.19秒)
+```
+
+4. Diff hygiene:
+
+```text
+git diff --check
+exit 0, no whitespace errors
+```
+
+Scoped working-tree result:
+
+```text
+ M Sources/DesktopPet/TeleportController.swift
+?? Sources/DesktopPetCore/CursorInteractionSessionState.swift
+?? Tests/DesktopPetTests/CursorInteractionSessionStateTests.swift
+?? .superpowers/sdd/cursor-prey-task-5-report.md
+```
+
+## Self-review Matrix
+
+| Path | Interaction behavior | Playback/hold ownership | Bubble behavior |
+| --- | --- | --- | --- |
+| Classic appear, eligible | overlay → held one-shot → frame-1 appear | hold consumed, ordinary restore owned by engine | random reminder suppressed |
+| Bridge arrival, eligible | same shared classic landing preparation | same as classic | random reminder suppressed |
+| Swarm arrival, eligible | same preparation before live-pet handoff | hold consumed once | random reminder suppressed |
+| Any effect, missing candidate | no overlay or one-shot | ordinary hold released once | existing reminder preserved |
+| Overlay initial failure | cursor never remains hidden; pending clear | ordinary hold released once | existing reminder preserved |
+| One-shot start failure | partial overlay stopped/unhidden | ordinary hold released once | existing reminder preserved |
+| Normal one-shot completion | overlay/session cleanup only | engine applies its captured resolution | already suppressed for successful trip |
+| Drag/fling/hide/stop/quit | idempotent shared cleanup | active one-shot restored only once; pending does not advance | in-flight trip cancelled |
+| Overlay runtime failure | shared active cleanup | active one-shot cancelled/restored | successful-trip suppression retained |
+| Source delete/retag | `syncFromStore` invalidates pending/active pair | pending waits for landing fallback; active restores ordinary | pending landing falls back normally |
+| Manual summon/preview during interaction | cancels pending/active first, then explicit trip | active restore precedes new trip | existing explicit/random arrival bubble retained |
+
+## Files Changed by Task 5
+
+- `Sources/DesktopPet/TeleportController.swift`
+- `Sources/DesktopPetCore/CursorInteractionSessionState.swift`
+- `Tests/DesktopPetTests/CursorInteractionSessionStateTests.swift`
+- `.superpowers/sdd/cursor-prey-task-5-report.md`
+
+## Concerns
+
+- The deterministic lifecycle and all project tests are automated, but AppKit window/cursor timing and visual alignment still require the later manual validation described by OpenSpec task group 6; those manual checks are outside this task group's requested verification.
+
+## Review fixes
+
+### Abnormal one-shot termination ownership
+
+- `PlaylistEngine.playHeldCursorInteraction` now accepts separate normal-completion and abnormal-cancellation callbacks. Cancellation reports one of `.replacedByPlayback`, `.stopped`, `.requestedRestore`, or `.sourceInvalidated`.
+- `OneShotPlaybackState.cancel()` returns the terminated interaction ID exactly once. The engine uses that result as the authoritative gate for one cancellation notification; repeated cancellation cannot notify again.
+- External ordinary `playClip`, `stop`, explicit `cancelOneShotAndRestore`, missing current source during `tick`, and deletion/retag branches in `AppDelegate` all route through abnormal cancellation.
+- `TeleportController` registers a cancellation callback tied to the selected interaction ID. The callback only stops the overlay and clears active session state; it never starts/stops/restores playback, because the engine operation that raised it owns that mutation.
+- `syncFromStore` lets `.sourceInvalidated` terminate an active engine one-shot first, so the authoritative callback clears the overlay/session before the engine restores ordinary playback. Pending invalid sessions still clear without advancing playback.
+- Normal one-shot completion clears the cancellation callback without invoking it, calls only the normal completion closure, then applies the ordinary resolution if the playback generation is unchanged.
+- All handlers are detached before invocation. `playClip`, `stop`, cancellation restoration, and normal completion compare their captured revision after callbacks, so a reentrant newer playback request wins and the older operation cannot overwrite it.
+
+### Selected interaction frame validation
+
+- Interaction candidates now require `frames/00001.png` to exist, decode as `NSImage`, and report positive finite width and height in addition to valid tag/frame-count/fps/model dimensions.
+- The selected interaction is revalidated immediately before the prey overlay starts. An invalid or newly missing first frame therefore leaves the system cursor visible, does not start/suppress the one-shot, releases the ordinary hold through the existing fallback, and preserves the reminder bubble.
+
+### Timer generation safety
+
+- Every `restartTimer()` invalidates the prior timer and increments `timerRevision`; the scheduled timer and queued `@MainActor` task capture that revision.
+- `tick(timerRevision:)` rejects stale queued work through `PlaybackRevisionPolicy` before reading or mutating playback.
+- Timer setup now requires finite positive fps and a finite positive `1 / fps` interval. `playHeldCursorInteraction` applies the same timing validation before reporting success.
+
+### Activation rollback and petting isolation
+
+- `cursorInteraction.activate()` is now guarded. If it unexpectedly fails after the one-shot consumed the hold, rollback clears pending session state, restores the cursor/overlay, cancels and restores the one-shot, leaves `holdingEngine` consumed, and returns to normal reminder fallback without a second hold advance.
+- `AppDelegate.handlePetTapped` excludes all cursor-prey/cursor-interaction materials even if malformed or legacy data also carries the `petting` tag, so petting cannot start a special clip as ordinary playback.
+
+### Review-fix TDD evidence
+
+Tests were written before the new Core behavior:
+
+```text
+swift test --filter PlaybackRevisionPolicyTests
+```
+
+RED failures:
+
+```text
+error: cannot find 'PlaybackRevisionPolicy' in scope
+error: cannot convert value of type '()' to expected argument type 'String'
+error: Build failed
+```
+
+The failures prove both missing generation policy and missing cancellation identity/idempotency behavior.
+
+Focused GREEN evidence:
+
+```text
+swift test --filter PlaybackRevisionPolicyTests
+Executed 2 tests, with 0 failures (0 unexpected)
+
+swift test --filter OneShotPlaybackStateTests
+Executed 6 tests, with 0 failures (0 unexpected)
+```
+
+The new/updated deterministic coverage verifies exact-generation acceptance, stale-generation rejection, and that cancellation returns the active interaction exactly once before becoming harmless.
+
+### Review-fix final verification
+
+All commands used the task-scoped Swift/Clang caches documented earlier.
+
+```text
+swift test
+Executed 51 tests, with 0 failures (0 unexpected)
+
+swift build
+Build complete! (0.29秒)
+
+git diff --check
+exit 0, no whitespace errors
+```
+
+Additional files modified by the review fixes:
+
+- `Sources/DesktopPet/PlaylistEngine.swift`
+- `Sources/DesktopPet/AppDelegate.swift`
+- `Sources/DesktopPetCore/OneShotPlaybackState.swift`
+- `Sources/DesktopPetCore/PlaybackRevisionPolicy.swift`
+- `Tests/DesktopPetTests/OneShotPlaybackStateTests.swift`
+- `Tests/DesktopPetTests/PlaybackRevisionPolicyTests.swift`
+diff --git a/Sources/DesktopPet/AppDelegate.swift b/Sources/DesktopPet/AppDelegate.swift
+index 4253bcd..1d86ecf 100644
+--- a/Sources/DesktopPet/AppDelegate.swift
++++ b/Sources/DesktopPet/AppDelegate.swift
+@@ -137,6 +137,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         if engine.currentClipID == nil, let id = store.state.playableClips.first?.id {
+             engine.playClip(id: id)
+         } else if let id = engine.currentClipID, store.clip(id: id) == nil {
++            if engine.isPlayingOneShot {
++                engine.cancelOneShotAndRestore(reason: .sourceInvalidated)
++            } else if let next = store.state.playableClips.first?.id {
++                engine.playClip(id: next)
++            } else {
++                engine.stop()
++                petWindow?.refreshFrame()
++            }
++        } else if let id = engine.currentClipID,
++                  let clip = store.clip(id: id),
++                  engine.isPlayingOneShot,
++                  !clip.tags.contains(ClipTag.cursorInteraction) {
++            engine.cancelOneShotAndRestore(reason: .sourceInvalidated)
++        } else if let id = engine.currentClipID,
++                  store.clip(id: id)?.isCursorInteractionMaterial == true,
++                  !engine.isPlayingOneShot {
+             if let next = store.state.playableClips.first?.id {
+                 engine.playClip(id: next)
+             } else {
+@@ -147,7 +163,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+             engine.restartTimer()
+             petWindow?.refreshFrame()
+         }
+-        libraryWindow?.reload(preservingSelection: true)
+     }
+ 
+     private func syncPetFrame() {
+@@ -227,7 +242,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     }
+ 
+     private func handlePetTapped() {
+-        let candidates = store.state.clips.filter { $0.tags.contains(ClipTag.petting) }
++        let candidates = store.state.clips.filter {
++            $0.tags.contains(ClipTag.petting) && !$0.isCursorInteractionMaterial
++        }
+         if let clip = candidates.randomElement() {
+             engine.playClip(id: clip.id)
+         }
+@@ -262,14 +279,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+ 
+     @objc func openLibrary() {
+         if let libraryWindow {
+-            libraryWindow.reload()
+             libraryWindow.showWindow(nil)
++            libraryWindow.reload()
+             NSApp.activate(ignoringOtherApps: true)
+             return
+         }
+         let wc = LibraryWindowController(store: store, engine: engine)
+         libraryWindow = wc
+         wc.showWindow(nil)
++        wc.reload()
+         wc.window?.center()
+         NSApp.activate(ignoringOtherApps: true)
+     }
+diff --git a/Sources/DesktopPet/PlaylistEngine.swift b/Sources/DesktopPet/PlaylistEngine.swift
+index 1b4f32d..017212d 100644
+--- a/Sources/DesktopPet/PlaylistEngine.swift
++++ b/Sources/DesktopPet/PlaylistEngine.swift
+@@ -1,4 +1,12 @@
+ import Foundation
++import DesktopPetCore
++
++enum OneShotCancellationReason {
++    case replacedByPlayback
++    case stopped
++    case requestedRestore
++    case sourceInvalidated
++}
+ 
+ @MainActor
+ final class PlaylistEngine {
+@@ -13,6 +21,16 @@ final class PlaylistEngine {
+     private var holdingAtEnd = false
+     private var pendingNextID: String?
+     private var endingSoonFired = false
++    private var oneShotState = OneShotPlaybackState()
++    private var oneShotCompletionHandler: (() -> Void)?
++    private var oneShotCancellationHandler: ((OneShotCancellationReason) -> Void)?
++    private var playbackRevision: UInt = 0
++    private var timerRevision: UInt = 0
++
++    /// True only while a cursor-interaction clip is replacing a held ordinary clip.
++    var isPlayingOneShot: Bool {
++        oneShotState.isActive
++    }
+ 
+     /// Called when a clip reaches its last frame. Return `true` to advance immediately,
+     /// or `false` to hold on the last frame (caller must later call `resumeAfterHold`).
+@@ -27,6 +45,7 @@ final class PlaylistEngine {
+     func attach(store: LibraryStore) {
+         self.store = store
+         if currentClipID == nil {
++            advancePlaybackRevision()
+             currentClipID = store.state.playableClips.first?.id
+             currentFrameIndex = 1
+         }
+@@ -34,7 +53,7 @@ final class PlaylistEngine {
+     }
+ 
+     func restartTimer() {
+-        timer?.invalidate()
++        invalidateTimer()
+         holdingAtEnd = false
+         pendingNextID = nil
+         endingSoonFired = false
+@@ -42,19 +61,36 @@ final class PlaylistEngine {
+               let id = currentClipID,
+               let clip = store.clip(id: id),
+               clip.frameCount > 0,
++              clip.fps.isFinite,
+               clip.fps > 0 else {
+             return
+         }
+         let interval = 1.0 / clip.fps
+-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+-            Task { @MainActor in
+-                self?.tick()
++        guard interval.isFinite, interval > 0 else { return }
++
++        let revision = timerRevision
++        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
++            Task { @MainActor [weak self] in
++                self?.tick(timerRevision: revision)
+             }
+         }
+-        RunLoop.main.add(timer!, forMode: .common)
++        self.timer = timer
++        RunLoop.main.add(timer, forMode: .common)
+     }
+ 
+     func playClip(id: String) {
++        playClip(id: id, notifyingObservers: true)
++    }
++
++    func playClip(id: String, notifyingObservers: Bool) {
++        let requestRevision = advancePlaybackRevision()
++        cancelOneShot(reason: .replacedByPlayback)
++        guard PlaybackRevisionPolicy.shouldAccept(
++            expected: requestRevision,
++            current: playbackRevision
++        ) else {
++            return
++        }
+         holdingAtEnd = false
+         pendingNextID = nil
+         currentClipID = id
+@@ -62,7 +98,52 @@ final class PlaylistEngine {
+         remember(id)
+         store?.recordPlay(id: id)
+         restartTimer()
++        if notifyingObservers {
++            NotificationCenter.default.post(name: .playbackDidChange, object: id)
++        }
++    }
++
++    /// Replaces an active clip-end hold with one cursor-interaction pass.
++    /// The hold's queued ordinary clip remains the preferred return target.
++    @discardableResult
++    func playHeldCursorInteraction(
++        id: String,
++        completion: @escaping () -> Void = {},
++        cancellation: @escaping (OneShotCancellationReason) -> Void = { _ in }
++    ) -> Bool {
++        guard holdingAtEnd,
++              let store,
++              let clip = store.clip(id: id),
++              clip.tags.contains(ClipTag.cursorInteraction),
++              clip.frameCount > 0,
++              clip.fps.isFinite,
++              clip.fps > 0 else {
++            return false
++        }
++        let interval = 1.0 / clip.fps
++        guard interval.isFinite, interval > 0 else { return false }
++
++        let preferredReturnID = pendingNextID
++        let requestRevision = advancePlaybackRevision()
++        cancelOneShot(reason: .replacedByPlayback)
++        guard PlaybackRevisionPolicy.shouldAccept(
++            expected: requestRevision,
++            current: playbackRevision
++        ) else {
++            return false
++        }
++        holdingAtEnd = false
++        pendingNextID = nil
++        endingSoonFired = false
++        oneShotState.start(interactionID: id, preferredReturnID: preferredReturnID)
++        oneShotCompletionHandler = completion
++        oneShotCancellationHandler = cancellation
++        currentClipID = id
++        currentFrameIndex = 1
++        store.recordPlay(id: id)
++        restartTimer()
+         NotificationCenter.default.post(name: .playbackDidChange, object: id)
++        return true
+     }
+ 
+     /// Start playing from the first item in the current playable set.
+@@ -72,10 +153,44 @@ final class PlaylistEngine {
+     }
+ 
+     func stop() {
+-        timer?.invalidate()
+-        timer = nil
++        let requestRevision = advancePlaybackRevision()
++        cancelOneShot(reason: .stopped)
++        guard PlaybackRevisionPolicy.shouldAccept(
++            expected: requestRevision,
++            current: playbackRevision
++        ) else {
++            return
++        }
++        invalidateTimer()
++        currentClipID = nil
++        currentFrameIndex = 1
+         holdingAtEnd = false
+         pendingNextID = nil
++        endingSoonFired = false
++        NotificationCenter.default.post(name: .playbackDidChange, object: nil)
++    }
++
++    /// Cancels an interrupted one-shot and restores its best valid ordinary target.
++    func cancelOneShotAndRestore(
++        reason: OneShotCancellationReason = .requestedRestore
++    ) {
++        guard let resolution = oneShotState.finish(
++            availableOrdinaryIDs: store?.state.playableClips.map(\.id) ?? []
++        ) else {
++            return
++        }
++        let cancellation = oneShotCancellationHandler
++        oneShotCompletionHandler = nil
++        oneShotCancellationHandler = nil
++        let cancellationRevision = playbackRevision
++        cancellation?(reason)
++        guard PlaybackRevisionPolicy.shouldAccept(
++            expected: cancellationRevision,
++            current: playbackRevision
++        ) else {
++            return
++        }
++        playOneShotResolution(resolution)
+     }
+ 
+     /// Release a clip-end hold. If `playNext` is true, play the queued next clip (or loop).
+@@ -85,6 +200,7 @@ final class PlaylistEngine {
+         holdingAtEnd = false
+         pendingNextID = nil
+         guard playNext else {
++            advancePlaybackRevision()
+             currentFrameIndex = 1
+             endingSoonFired = false
+             return
+@@ -92,24 +208,42 @@ final class PlaylistEngine {
+         if let next {
+             playClip(id: next)
+         } else {
++            advancePlaybackRevision()
+             currentFrameIndex = 1
+             endingSoonFired = false
+         }
+     }
+ 
+-    private func tick() {
++    private func tick(timerRevision: UInt) {
++        guard PlaybackRevisionPolicy.shouldAccept(
++            expected: timerRevision,
++            current: self.timerRevision
++        ) else {
++            return
++        }
+         if holdingAtEnd { return }
+ 
+         guard let store,
+               let id = currentClipID,
+               let clip = store.clip(id: id) else {
++            if isPlayingOneShot {
++                cancelOneShotAndRestore(reason: .sourceInvalidated)
++                return
++            }
+             stop()
+             return
+         }
+ 
+         if currentFrameIndex < clip.frameCount {
+             currentFrameIndex += 1
+-            notifyEndingSoonIfNeeded(clip: clip)
++            if !isPlayingOneShot {
++                notifyEndingSoonIfNeeded(clip: clip)
++            }
++            return
++        }
++
++        if isPlayingOneShot {
++            completeOneShot()
+             return
+         }
+ 
+@@ -129,13 +263,68 @@ final class PlaylistEngine {
+     }
+ 
+     private func notifyEndingSoonIfNeeded(clip: PetClip) {
+-        guard !endingSoonFired, clip.fps > 0 else { return }
++        guard !endingSoonFired,
++              clip.fps.isFinite,
++              clip.fps > 0 else {
++            return
++        }
+         let remaining = Double(clip.frameCount - currentFrameIndex) / clip.fps
+         guard remaining <= endingSoonLeadTime else { return }
+         endingSoonFired = true
+         clipEndingSoonHandler?(max(0, remaining))
+     }
+ 
++    private func completeOneShot() {
++        guard let resolution = oneShotState.finish(
++            availableOrdinaryIDs: store?.state.playableClips.map(\.id) ?? []
++        ) else {
++            return
++        }
++        let completion = oneShotCompletionHandler
++        oneShotCompletionHandler = nil
++        oneShotCancellationHandler = nil
++        let completionRevision = playbackRevision
++        completion?()
++        guard OneShotPlaybackState.shouldApplyCompletionResolution(
++            completionRevision: completionRevision,
++            currentPlaybackRevision: playbackRevision
++        ) else {
++            return
++        }
++        playOneShotResolution(resolution)
++    }
++
++    @discardableResult
++    private func cancelOneShot(reason: OneShotCancellationReason) -> Bool {
++        guard oneShotState.cancel() != nil else { return false }
++        let cancellation = oneShotCancellationHandler
++        oneShotCompletionHandler = nil
++        oneShotCancellationHandler = nil
++        cancellation?(reason)
++        return true
++    }
++
++    @discardableResult
++    private func advancePlaybackRevision() -> UInt {
++        playbackRevision &+= 1
++        return playbackRevision
++    }
++
++    private func invalidateTimer() {
++        timerRevision &+= 1
++        timer?.invalidate()
++        timer = nil
++    }
++
++    private func playOneShotResolution(_ resolution: OneShotPlaybackState.Resolution) {
++        switch resolution {
++        case let .play(id):
++            playClip(id: id)
++        case .stop:
++            stop()
++        }
++    }
++
+     private func pickNext(after clip: PetClip, store: LibraryStore) -> String? {
+         let clips = store.state.playableClips
+         guard !clips.isEmpty else { return nil }
+diff --git a/Sources/DesktopPet/TeleportController.swift b/Sources/DesktopPet/TeleportController.swift
+index 62945bd..5fc689e 100644
+--- a/Sources/DesktopPet/TeleportController.swift
++++ b/Sources/DesktopPet/TeleportController.swift
+@@ -10,10 +10,25 @@ final class TeleportController {
+         case appearing
+     }
+ 
++    private enum TripProvenance {
++        case autonomous
++        case explicit
++
++        var isAutonomous: Bool {
++            self == .autonomous
++        }
++    }
++
++    private enum LandingPresentation {
++        case effect
++        case swarm
++    }
++
+     private let store: LibraryStore
+     private let pet: PetWindowController
+     private let engine: PlaylistEngine
+     private let effects: TeleportEffectRenderer
++    private let cursorPreyOverlay = CursorPreyOverlayController()
+ 
+     private var phase: Phase = .idle
+     private var hiddenWork: DispatchWorkItem?
+@@ -40,6 +55,8 @@ final class TeleportController {
+     private let swarm = TileSwarmRenderer()
+     /// True while we asked the engine to hold on the last frame of a clip.
+     private var holdingEngine = false
++    private var cursorInteraction = CursorInteractionSessionState()
++    private var suppressReminderThisTrip = false
+ 
+     init(store: LibraryStore, pet: PetWindowController, engine: PlaylistEngine) {
+         self.store = store
+@@ -64,6 +81,9 @@ final class TeleportController {
+         pet.onFrameRendered = { [weak self] image in
+             self?.effects.updateLiveFrame(image)
+         }
++        cursorPreyOverlay.onFailure = { [weak self] in
++            self?.cleanupCursorInteraction(restorePlayback: true)
++        }
+     }
+ 
+     func start() {
+@@ -84,6 +104,16 @@ final class TeleportController {
+     }
+ 
+     func syncFromStore() {
++        if cursorInteraction.phase != .idle,
++           !isPreparedInteractionStillValid() {
++            if cursorInteraction.phase == .active, engine.isPlayingOneShot {
++                // Let the engine's authoritative abnormal-termination signal
++                // clear the overlay/session before it restores ordinary play.
++                engine.cancelOneShotAndRestore(reason: .sourceInvalidated)
++            } else {
++                cleanupCursorInteraction(restorePlayback: false)
++            }
++        }
+         guard store.state.teleportEnabled, petOrderedVisible else {
+             cancelInFlight(reschedule: false)
+             pet.restorePetPresentation()
+@@ -97,7 +127,13 @@ final class TeleportController {
+     /// moving as it dissolves, instead of freezing into a static sticker.
+     private func handleClipEndingSoon(remaining: TimeInterval) {
+         _ = remaining
+-        guard store.state.teleportEnabled, petOrderedVisible, phase == .idle, !pet.isFlinging else { return }
++        guard store.state.teleportEnabled,
++              petOrderedVisible,
++              phase == .idle,
++              cursorInteraction.phase == .idle,
++              !pet.isFlinging else {
++            return
++        }
+         let roll = Double.random(in: 0...1)
+         guard TeleportMath.shouldTeleportAtClipEnd(
+             frequency: store.state.teleportFrequency,
+@@ -124,7 +160,7 @@ final class TeleportController {
+             vanishDraw: TeleportMath.pickStyle(unitRandom: Double.random(in: 0...1)),
+             appearDraw: TeleportMath.pickStyle(unitRandom: Double.random(in: 0...1))
+         )
+-        startTrip(vanish: pair.vanish, appear: pair.appear)
++        startTrip(vanish: pair.vanish, appear: pair.appear, provenance: .autonomous)
+     }
+ 
+     /// Debug / tuning entry: run a full trip immediately, bypassing the
+@@ -132,13 +168,13 @@ final class TeleportController {
+     /// (predictable for tuning); nil draws both ends independently.
+     func previewTrip(style: TeleportEffectStyle?) {
+         if let style {
+-            startTrip(vanish: style, appear: style)
++            startTrip(vanish: style, appear: style, provenance: .explicit)
+         } else {
+             let pair = TeleportMath.resolveStylePair(
+                 vanishDraw: TeleportMath.pickStyle(unitRandom: Double.random(in: 0...1)),
+                 appearDraw: TeleportMath.pickStyle(unitRandom: Double.random(in: 0...1))
+             )
+-            startTrip(vanish: pair.vanish, appear: pair.appear)
++            startTrip(vanish: pair.vanish, appear: pair.appear, provenance: .explicit)
+         }
+     }
+ 
+@@ -152,6 +188,7 @@ final class TeleportController {
+         startTrip(
+             vanish: pair.vanish,
+             appear: pair.appear,
++            provenance: .explicit,
+             landing: .cursorNudge,
+             arrivalMessage: message
+         )
+@@ -165,15 +202,25 @@ final class TeleportController {
+     private func startTrip(
+         vanish: TeleportEffectStyle,
+         appear: TeleportEffectStyle,
++        provenance: TripProvenance,
+         landing: TeleportLandingMode? = nil,
+         arrivalMessage message: String? = nil
+     ) {
+-        guard petOrderedVisible, phase == .idle, !pet.isFlinging else { return }
++        if !provenance.isAutonomous, cursorInteraction.phase != .idle {
++            cancelInFlight(reschedule: false)
++        }
++        guard petOrderedVisible,
++              phase == .idle,
++              !pet.isFlinging,
++              !provenance.isAutonomous || cursorInteraction.phase == .idle else {
++            return
++        }
+         // The trip owns window geometry until finishTrip / cancel.
+         pet.freezeFrameForTeleport = true
+         vanishStyle = vanish
+         appearStyle = appear
+         arrivalMessage = message
++        suppressReminderThisTrip = false
+         pendingMode = landing ?? TeleportMath.pickLandingMode(
+             nudgeEnabled: store.state.cursorNudgeEnabled,
+             unitRandom: Double.random(in: 0...1)
+@@ -185,6 +232,10 @@ final class TeleportController {
+         // and appear slides in from it.
+         let frame = pet.currentPetFrame()
+         let destination = resolveDestination()
++        prepareCursorInteractionIfEligible(
++            isAutonomous: provenance.isAutonomous,
++            hasExplicitArrivalMessage: message != nil
++        )
+         pendingDestination = destination
+         travelFrom = CGPoint(x: frame.midX, y: frame.midY)
+         travelTo = CGPoint(
+@@ -250,7 +301,7 @@ final class TeleportController {
+ 
+     private func beginSwarmTrip() {
+         guard let snapshot = pet.petSnapshot(), let destination = pendingDestination else {
+-            pet.freezeFrameForTeleport = false
++            cancelInFlight(reschedule: false)
+             return
+         }
+         phase = .vanishing
+@@ -261,9 +312,7 @@ final class TeleportController {
+         swarm.play(fromRect: fromRect, toRect: toRect, snapshot: snapshot) { [weak self] in
+             guard let self, self.phase == .vanishing else { return }
+             self.phase = .appearing
+-            self.pet.setPetHiddenForTeleport(false)
+-            self.pet.effectHost.alphaValue = 1
+-            self.finishTrip()
++            self.prepareLandingPresentation(.swarm)
+         }
+     }
+ 
+@@ -316,28 +365,54 @@ final class TeleportController {
+     private func beginAppear() {
+         guard phase == .hidden else { return }
+         phase = .appearing
+-        // Release the hold FIRST: the next clip starts and its frames flow
+-        // into the effect's staging layers, so the cat is already moving
+-        // while it materializes. The short delay lets the window resize to
+-        // the new clip before the effect measures its geometry.
+-        releaseEngineHold()
+-        pet.setPetHiddenForTeleport(false)
+-        pet.effectHost.alphaValue = 0
+-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+-            guard let self, self.phase == .appearing else { return }
+-            // Window frames are frozen for the whole trip; place the
+-            // landing frame exactly once, sized for the clip that is about
+-            // to appear and centered on the landing point. The effect, its
+-            // canvas and the restored live window all share this ONE rect —
+-            // no tick-ordering can shift it anymore.
+-            self.placeLandingFrame()
+-            self.effects.playAppear(
+-                style: self.appearStyle,
+-                onPet: self.pet.effectHost,
+-                towards: self.travelDirection
++        prepareLandingPresentation(.effect)
++    }
++
++    /// Shared arrival ordering for classic effects and the integrated swarm:
++    /// cursor prey, interaction clip from frame 1, then visible cat presentation.
++    private func prepareLandingPresentation(_ presentation: LandingPresentation) {
++        guard phase == .appearing else { return }
++        let interactionStarted = startPendingCursorInteraction()
++        if !interactionStarted {
++            releaseEngineHold()
++        }
++        pet.refreshFrame()
++
++        // A successful interaction is already on frame 1 and must be
++        // presented before even a single-frame clip can complete. Preserve
++        // the classic path's existing settling delay only for its ordinary
++        // non-interactive fallback; swarm has always handed off immediately.
++        if interactionStarted || presentation == .swarm {
++            presentLanding(presentation)
++        } else {
++            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
++                self?.presentLanding(presentation)
++            }
++        }
++    }
++
++    private func presentLanding(_ presentation: LandingPresentation) {
++        guard phase == .appearing else { return }
++        // Window frames are frozen for the whole trip; place the landing
++        // frame exactly once, sized for the clip that is about to appear and
++        // centered on the landing point. Effect, canvas and live window share
++        // this rect, so no tick-ordering can shift it later.
++        placeLandingFrame()
++        switch presentation {
++        case .effect:
++            pet.effectHost.alphaValue = 0
++            pet.setPetHiddenForTeleport(false)
++            effects.playAppear(
++                style: appearStyle,
++                onPet: pet.effectHost,
++                towards: travelDirection
+             ) { [weak self] in
+                 self?.finishTrip()
+             }
++        case .swarm:
++            pet.effectHost.alphaValue = 1
++            pet.setPetHiddenForTeleport(false)
++            finishTrip()
+         }
+     }
+ 
+@@ -352,9 +427,175 @@ final class TeleportController {
+         pet.setTeleportLandingFrame(center: travelTo, size: size)
+     }
+ 
++    private func prepareCursorInteractionIfEligible(
++        isAutonomous: Bool,
++        hasExplicitArrivalMessage: Bool
++    ) {
++        guard cursorInteraction.phase == .idle,
++              isAutonomous,
++              pendingMode == .cursorNudge,
++              !hasExplicitArrivalMessage else {
++            return
++        }
++
++        let preyCandidates = store.state.clips.filter(isValidPreyCandidate)
++        let interactionCandidates = store.state.clips.filter(isValidInteractionCandidate)
++        // A malformed legacy entry may carry both tags. Only consider prey
++        // choices that still leave at least one distinct cat action.
++        let pairablePreyCandidates = preyCandidates.filter { prey in
++            interactionCandidates.contains { $0.id != prey.id }
++        }
++
++        guard CursorInteractionPolicy.isInteractionEligible(
++            isAutonomous: isAutonomous,
++            landingMode: pendingMode,
++            hasPreyCandidate: !pairablePreyCandidates.isEmpty,
++            hasInteractionCandidate: !interactionCandidates.isEmpty
++        ),
++        let prey = pairablePreyCandidates.randomElement(),
++        let interaction = interactionCandidates
++            .filter({ $0.id != prey.id })
++            .randomElement() else {
++            return
++        }
++
++        _ = cursorInteraction.prepare(
++            preyID: prey.id,
++            interactionID: interaction.id
++        )
++    }
++
++    private func startPendingCursorInteraction() -> Bool {
++        guard cursorInteraction.phase == .pending else { return false }
++        guard let preyID = cursorInteraction.preyID,
++              let interactionID = cursorInteraction.interactionID,
++              let prey = store.clip(id: preyID),
++              let interaction = store.clip(id: interactionID),
++              preyID != interactionID,
++              isValidPreyCandidate(prey),
++              isValidInteractionCandidate(interaction) else {
++            cleanupCursorInteraction(restorePlayback: true)
++            return false
++        }
++
++        let settings = prey.cursorPreySettings ?? CursorPreySettings()
++        guard cursorPreyOverlay.start(clip: prey, settings: settings) else {
++            cleanupCursorInteraction(restorePlayback: true)
++            return false
++        }
++
++        let started = engine.playHeldCursorInteraction(
++            id: interactionID,
++            completion: { [weak self] in
++                self?.completeCursorInteraction(expectedInteractionID: interactionID)
++            },
++            cancellation: { [weak self] _ in
++                self?.cancelCursorInteractionFromEngine(
++                    expectedInteractionID: interactionID
++                )
++            }
++        )
++        guard started else {
++            cleanupCursorInteraction(restorePlayback: true)
++            return false
++        }
++
++        // playHeldCursorInteraction consumed the engine's hold. Clearing the
++        // controller flag prevents finish/cancel from advancing it again.
++        holdingEngine = false
++        guard cursorInteraction.activate() else {
++            // The engine has already consumed the hold, so rollback is an
++            // interrupted one-shot restoration rather than a hold release.
++            _ = cursorInteraction.clear()
++            cursorPreyOverlay.stop()
++            if engine.isPlayingOneShot {
++                engine.cancelOneShotAndRestore()
++            }
++            return false
++        }
++        suppressReminderThisTrip = true
++        return true
++    }
++
++    private func isPreparedInteractionStillValid() -> Bool {
++        guard let preyID = cursorInteraction.preyID,
++              let interactionID = cursorInteraction.interactionID,
++              preyID != interactionID,
++              let prey = store.clip(id: preyID),
++              let interaction = store.clip(id: interactionID) else {
++            return false
++        }
++        return isValidPreyCandidate(prey) && isValidInteractionCandidate(interaction)
++    }
++
++    private func isValidPreyCandidate(_ clip: PetClip) -> Bool {
++        clip.tags.contains(ClipTag.cursorPrey) && isRenderableCandidate(clip)
++    }
++
++    private func isValidInteractionCandidate(_ clip: PetClip) -> Bool {
++        clip.tags.contains(ClipTag.cursorInteraction)
++            && isRenderableCandidate(clip)
++            && hasDecodableFirstFrame(clip)
++    }
++
++    private func isRenderableCandidate(_ clip: PetClip) -> Bool {
++        clip.frameCount > 0
++            && clip.fps.isFinite
++            && clip.fps > 0
++            && clip.displayWidth > 0
++            && clip.displayHeight > 0
++    }
++
++    private func hasDecodableFirstFrame(_ clip: PetClip) -> Bool {
++        let url = AppPaths.clipsRoot
++            .appendingPathComponent(clip.id, isDirectory: true)
++            .appendingPathComponent("frames", isDirectory: true)
++            .appendingPathComponent("00001.png")
++        guard FileManager.default.fileExists(atPath: url.path),
++              let image = NSImage(contentsOf: url),
++              image.size.width.isFinite,
++              image.size.height.isFinite,
++              image.size.width > 0,
++              image.size.height > 0 else {
++            return false
++        }
++        return true
++    }
++
++    private func completeCursorInteraction(expectedInteractionID: String) {
++        guard cursorInteraction.phase == .active,
++              cursorInteraction.interactionID == expectedInteractionID else {
++            return
++        }
++        // PlaylistEngine has already resolved its one-shot state and owns
++        // ordinary restoration after this callback returns.
++        cleanupCursorInteraction(restorePlayback: false)
++    }
++
++    private func cancelCursorInteractionFromEngine(expectedInteractionID: String) {
++        guard cursorInteraction.phase == .active,
++              cursorInteraction.interactionID == expectedInteractionID else {
++            return
++        }
++        // The engine is already applying the external playback/stop/restore
++        // mutation that caused this callback. Only clear presentation state.
++        cleanupCursorInteraction(restorePlayback: false)
++    }
++
++    private func cleanupCursorInteraction(restorePlayback: Bool) {
++        let cleanup = cursorInteraction.clear()
++        cursorPreyOverlay.stop()
++        guard restorePlayback,
++              cleanup == .active,
++              engine.isPlayingOneShot else {
++            return
++        }
++        engine.cancelOneShotAndRestore()
++    }
++
+     private func finishTrip() {
+         guard phase == .appearing else { return }
+-        if pendingMode == .cursorNudge {
++        if pendingMode == .cursorNudge, !suppressReminderThisTrip {
+             let text: String?
+             if let arrivalMessage {
+                 text = arrivalMessage
+@@ -369,6 +610,7 @@ final class TeleportController {
+             }
+         }
+         arrivalMessage = nil
++        suppressReminderThisTrip = false
+         phase = .idle
+         pet.freezeFrameForTeleport = false
+         releaseEngineHold()
+@@ -380,10 +622,13 @@ final class TeleportController {
+         streak.cancel()
+         swarm.cancel()
+         effects.cancel()
++        cleanupCursorInteraction(restorePlayback: true)
+         pet.restorePetPresentation()
+         phase = .idle
+         originMovedThisTrip = false
+         pendingDestination = nil
++        arrivalMessage = nil
++        suppressReminderThisTrip = false
+         // Always release a hold so playback does not freeze forever.
+         releaseEngineHold()
+         _ = reschedule // clip-end driven; next opportunity is the next clip finish
+diff --git a/Sources/DesktopPetCore/CursorInteractionSessionState.swift b/Sources/DesktopPetCore/CursorInteractionSessionState.swift
+new file mode 100644
+index 0000000..d0b7bdc
+--- /dev/null
++++ b/Sources/DesktopPetCore/CursorInteractionSessionState.swift
+@@ -0,0 +1,66 @@
++import Foundation
++
++/// Pure lifecycle state for one paired cursor-prey interaction.
++public struct CursorInteractionSessionState: Equatable {
++    public enum Phase: Equatable {
++        case idle
++        case pending
++        case active
++    }
++
++    public enum Cleanup: Equatable {
++        case pending
++        case active
++    }
++
++    public private(set) var phase: Phase = .idle
++    public private(set) var preyID: String?
++    public private(set) var interactionID: String?
++
++    public init() {}
++
++    /// Saves one distinct pair without replacing an existing session.
++    @discardableResult
++    public mutating func prepare(preyID: String, interactionID: String) -> Bool {
++        guard phase == .idle,
++              preyID != interactionID else {
++            return false
++        }
++
++        self.preyID = preyID
++        self.interactionID = interactionID
++        phase = .pending
++        return true
++    }
++
++    /// Marks a prepared pair active exactly once.
++    @discardableResult
++    public mutating func activate() -> Bool {
++        guard phase == .pending,
++              preyID != nil,
++              interactionID != nil else {
++            return false
++        }
++        phase = .active
++        return true
++    }
++
++    /// Clears the session and reports its former phase exactly once.
++    @discardableResult
++    public mutating func clear() -> Cleanup? {
++        let cleanup: Cleanup
++        switch phase {
++        case .idle:
++            return nil
++        case .pending:
++            cleanup = .pending
++        case .active:
++            cleanup = .active
++        }
++
++        phase = .idle
++        preyID = nil
++        interactionID = nil
++        return cleanup
++    }
++}
+diff --git a/Tests/DesktopPetTests/CursorInteractionSessionStateTests.swift b/Tests/DesktopPetTests/CursorInteractionSessionStateTests.swift
+new file mode 100644
+index 0000000..7ed461b
+--- /dev/null
++++ b/Tests/DesktopPetTests/CursorInteractionSessionStateTests.swift
+@@ -0,0 +1,71 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class CursorInteractionSessionStateTests: XCTestCase {
++    func testPrepareStoresDistinctPairAsPending() {
++        var state = CursorInteractionSessionState()
++
++        XCTAssertTrue(state.prepare(preyID: "prey", interactionID: "cat"))
++
++        XCTAssertEqual(state.phase, .pending)
++        XCTAssertEqual(state.preyID, "prey")
++        XCTAssertEqual(state.interactionID, "cat")
++    }
++
++    func testPrepareRejectsSameClipForBothRoles() {
++        var state = CursorInteractionSessionState()
++
++        XCTAssertFalse(state.prepare(preyID: "shared", interactionID: "shared"))
++
++        XCTAssertEqual(state.phase, .idle)
++        XCTAssertNil(state.preyID)
++        XCTAssertNil(state.interactionID)
++    }
++
++    func testActivateTransitionsPendingSessionOnly() {
++        var state = CursorInteractionSessionState()
++
++        XCTAssertFalse(state.activate())
++        XCTAssertTrue(state.prepare(preyID: "prey", interactionID: "cat"))
++        XCTAssertTrue(state.activate())
++        XCTAssertFalse(state.activate())
++
++        XCTAssertEqual(state.phase, .active)
++        XCTAssertEqual(state.preyID, "prey")
++        XCTAssertEqual(state.interactionID, "cat")
++    }
++
++    func testClearPendingReturnsPendingCleanupExactlyOnce() {
++        var state = CursorInteractionSessionState()
++        XCTAssertTrue(state.prepare(preyID: "prey", interactionID: "cat"))
++
++        XCTAssertEqual(state.clear(), .pending)
++        XCTAssertNil(state.clear())
++
++        XCTAssertEqual(state.phase, .idle)
++        XCTAssertNil(state.preyID)
++        XCTAssertNil(state.interactionID)
++    }
++
++    func testClearActiveReturnsActiveCleanupExactlyOnce() {
++        var state = CursorInteractionSessionState()
++        XCTAssertTrue(state.prepare(preyID: "prey", interactionID: "cat"))
++        XCTAssertTrue(state.activate())
++
++        XCTAssertEqual(state.clear(), .active)
++        XCTAssertNil(state.clear())
++
++        XCTAssertEqual(state.phase, .idle)
++    }
++
++    func testPrepareDoesNotReplacePendingOrActiveSession() {
++        var state = CursorInteractionSessionState()
++        XCTAssertTrue(state.prepare(preyID: "prey-1", interactionID: "cat-1"))
++        XCTAssertFalse(state.prepare(preyID: "prey-2", interactionID: "cat-2"))
++        XCTAssertTrue(state.activate())
++        XCTAssertFalse(state.prepare(preyID: "prey-3", interactionID: "cat-3"))
++
++        XCTAssertEqual(state.preyID, "prey-1")
++        XCTAssertEqual(state.interactionID, "cat-1")
++    }
++}
+diff --git a/Tests/DesktopPetTests/OneShotPlaybackStateTests.swift b/Tests/DesktopPetTests/OneShotPlaybackStateTests.swift
+new file mode 100644
+index 0000000..355c270
+--- /dev/null
++++ b/Tests/DesktopPetTests/OneShotPlaybackStateTests.swift
+@@ -0,0 +1,68 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class OneShotPlaybackStateTests: XCTestCase {
++    func testStartCapturesPreferredOrdinaryReturnID() {
++        var state = OneShotPlaybackState()
++
++        state.start(interactionID: "interaction", preferredReturnID: "ordinary")
++
++        XCTAssertTrue(state.isActive)
++        XCTAssertEqual(state.interactionID, "interaction")
++        XCTAssertEqual(state.preferredReturnID, "ordinary")
++    }
++
++    func testFinishReturnsCapturedOrdinaryClipAndIsHarmlessWhenRepeated() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "ordinary")
++
++        XCTAssertEqual(
++            state.finish(availableOrdinaryIDs: ["fallback", "ordinary"]),
++            .play("ordinary")
++        )
++        XCTAssertFalse(state.isActive)
++        XCTAssertNil(state.finish(availableOrdinaryIDs: ["fallback", "ordinary"]))
++    }
++
++    func testCancelReturnsTerminatedInteractionExactlyOnce() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "ordinary")
++
++        XCTAssertEqual(state.cancel(), "interaction")
++        XCTAssertNil(state.cancel())
++
++        XCTAssertFalse(state.isActive)
++        XCTAssertNil(state.finish(availableOrdinaryIDs: ["ordinary"]))
++    }
++
++    func testFinishFallsBackToFirstAvailableOrdinaryClipWhenPreferredReturnIsInvalid() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "removed")
++
++        XCTAssertEqual(
++            state.finish(availableOrdinaryIDs: ["fallback", "another"]),
++            .play("fallback")
++        )
++    }
++
++    func testFinishStopsWhenNoOrdinaryFallbackExists() {
++        var state = OneShotPlaybackState()
++        state.start(interactionID: "interaction", preferredReturnID: "removed")
++
++        XCTAssertEqual(state.finish(availableOrdinaryIDs: []), .stop)
++    }
++
++    func testCompletionResolutionRejectsANewSameIDSessionWithChangedRevision() {
++        let completionRevision: UInt = 41
++        let sameIDNewSessionRevision: UInt = 42
++
++        XCTAssertTrue(OneShotPlaybackState.shouldApplyCompletionResolution(
++            completionRevision: completionRevision,
++            currentPlaybackRevision: completionRevision
++        ))
++        XCTAssertFalse(OneShotPlaybackState.shouldApplyCompletionResolution(
++            completionRevision: completionRevision,
++            currentPlaybackRevision: sameIDNewSessionRevision
++        ))
++    }
++}
+

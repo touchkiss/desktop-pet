@@ -2,6 +2,17 @@ import XCTest
 @testable import DesktopPetCore
 
 final class IdlePresentationPolicyTests: XCTestCase {
+    func testHIDIdleTimeQueryUsesAnyInputEventSentinel() {
+        var queriedEventType: UInt32?
+        let seconds = HIDIdleTimeQuery.secondsSinceAnyInput { eventType in
+            queriedEventType = eventType
+            return 42
+        }
+
+        XCTAssertEqual(seconds, 42)
+        XCTAssertEqual(queriedEventType, UInt32.max)
+    }
+
     func testSupportedDelaysAndLegacyDefaultAreExact() {
         XCTAssertEqual(IdlePresentationPolicy.supportedIdleDelays, [60, 180, 300, 600, 900, 1800])
         XCTAssertEqual(

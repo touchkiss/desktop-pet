@@ -1,0 +1,342 @@
+diff --git a/Sources/DesktopPet/CursorPreyOverlayController.swift b/Sources/DesktopPet/CursorPreyOverlayController.swift
+new file mode 100644
+index 0000000..bb168c9
+--- /dev/null
++++ b/Sources/DesktopPet/CursorPreyOverlayController.swift
+@@ -0,0 +1,253 @@
++import AppKit
++import DesktopPetCore
++
++/// Click-through cursor visual that loops a keyed prey clip while preserving
++/// the real cursor as the only input hotspot.
++@MainActor
++final class CursorPreyOverlayController {
++    /// Called once when an already-active overlay can no longer render safely.
++    var onFailure: (() -> Void)?
++
++    private(set) var isActive = false
++
++    private let cacheLimit = 24
++    private var window: NSWindow?
++    private var imageView: NSImageView?
++    private var frameTimer: Timer?
++    private var cursorTimer: Timer?
++    private var playback = CursorPreyPlaybackState()
++    private var clipID: String?
++    private var fps = 0.0
++    private var frameCache: [Int: NSImage] = [:]
++    private var cacheOrder: [Int] = []
++    private var ownsHiddenCursor = false
++    private var sessionRevision: UInt = 0
++
++    isolated deinit {
++        stop()
++    }
++
++    /// Presents a cursor-prey clip. Failures before the first visible frame do
++    /// not hide the system cursor and are reported to the caller as `false`.
++    @discardableResult
++    func start(clip: PetClip, settings: CursorPreySettings) -> Bool {
++        stop()
++
++        guard clip.tags.contains(ClipTag.cursorPrey),
++              clip.frameCount > 0,
++              clip.fps.isFinite,
++              clip.fps > 0,
++              clip.displayWidth > 0,
++              clip.displayHeight > 0,
++              let firstImage = loadImage(clipID: clip.id, index: 1),
++              firstImage.size.width.isFinite,
++              firstImage.size.height.isFinite,
++              firstImage.size.width > 0,
++              firstImage.size.height > 0 else {
++            return false
++        }
++
++        let size = overlaySize(for: clip, displaySize: settings.displaySize)
++        guard size.width.isFinite, size.height.isFinite,
++              size.width > 0, size.height > 0,
++              let window = makeWindow(size: size),
++              let imageView = window.contentView as? NSImageView else {
++            return false
++        }
++
++        self.window = window
++        self.imageView = imageView
++        clipID = clip.id
++        fps = clip.fps
++        frameCache[1] = firstImage
++        cacheOrder = [1]
++        guard playback.start(frameCount: clip.frameCount),
++              positionWindowAtCursor(),
++              showFirstFrame(in: window, imageView: imageView) else {
++            stop()
++            return false
++        }
++
++        // The first frame is on-screen before this balanced hide call.
++        NSCursor.hide()
++        ownsHiddenCursor = true
++        isActive = true
++
++        let revision = sessionRevision
++        guard startTimers(for: revision) else {
++            failActiveOverlay()
++            return false
++        }
++        return true
++    }
++
++    /// Stops the overlay and restores the pointer only if this controller hid it.
++    func stop() {
++        sessionRevision &+= 1
++        frameTimer?.invalidate()
++        frameTimer = nil
++        cursorTimer?.invalidate()
++        cursorTimer = nil
++
++        window?.orderOut(nil)
++        window?.contentView = nil
++        window = nil
++        imageView = nil
++        frameCache.removeAll(keepingCapacity: false)
++        cacheOrder.removeAll(keepingCapacity: false)
++        clipID = nil
++        fps = 0
++        playback.stop()
++        isActive = false
++
++        if ownsHiddenCursor {
++            NSCursor.unhide()
++            ownsHiddenCursor = false
++        }
++    }
++
++    private func makeWindow(size: CGSize) -> NSWindow? {
++        let window = CursorPreyOverlayWindow(
++            contentRect: CGRect(origin: .zero, size: size),
++            styleMask: [.borderless],
++            backing: .buffered,
++            defer: false
++        )
++        window.isOpaque = false
++        window.backgroundColor = .clear
++        window.hasShadow = false
++        window.ignoresMouseEvents = true
++        window.level = .floating
++        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
++        window.isReleasedWhenClosed = false
++
++        let imageView = NSImageView(frame: CGRect(origin: .zero, size: size))
++        imageView.imageAlignment = .alignCenter
++        imageView.imageScaling = .scaleProportionallyUpOrDown
++        imageView.autoresizingMask = [.width, .height]
++        window.contentView = imageView
++        return window
++    }
++
++    private func overlaySize(for clip: PetClip, displaySize: Double) -> CGSize {
++        let longestSide = CGFloat(CursorInteractionPolicy.clampedPreyDisplaySize(displaySize))
++        let aspectRatio = CGFloat(clip.displayWidth) / CGFloat(clip.displayHeight)
++        if aspectRatio >= 1 {
++            return CGSize(width: longestSide, height: longestSide / aspectRatio)
++        }
++        return CGSize(width: longestSide * aspectRatio, height: longestSide)
++    }
++
++    private func showFirstFrame(in window: NSWindow, imageView: NSImageView) -> Bool {
++        guard let image = frameCache[1] else { return false }
++        imageView.image = image
++        imageView.displayIfNeeded()
++        window.orderFrontRegardless()
++        window.displayIfNeeded()
++        return window.isVisible
++    }
++
++    private func startTimers(for revision: UInt) -> Bool {
++        guard fps.isFinite, fps > 0 else { return false }
++
++        let frameTimer = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in
++            Task { @MainActor [weak self] in
++                self?.advanceFrame(for: revision)
++            }
++        }
++        let cursorTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
++            Task { @MainActor [weak self] in
++                self?.followCursor(for: revision)
++            }
++        }
++        self.frameTimer = frameTimer
++        self.cursorTimer = cursorTimer
++        RunLoop.main.add(frameTimer, forMode: .common)
++        RunLoop.main.add(cursorTimer, forMode: .common)
++        return frameTimer.isValid && cursorTimer.isValid
++    }
++
++    private func advanceFrame(for revision: UInt) {
++        guard isActive, revision == sessionRevision else { return }
++        guard frameTimer?.isValid == true,
++              let nextFrame = playback.advance(),
++              let image = loadFrame(nextFrame) else {
++            failActiveOverlay()
++            return
++        }
++        imageView?.image = image
++    }
++
++    private func followCursor(for revision: UInt) {
++        guard isActive, revision == sessionRevision else { return }
++        guard cursorTimer?.isValid == true, positionWindowAtCursor() else {
++            failActiveOverlay()
++            return
++        }
++    }
++
++    private func positionWindowAtCursor() -> Bool {
++        guard let window else { return false }
++        let cursor = NSEvent.mouseLocation
++        guard NSScreen.screens.contains(where: { $0.frame.contains(cursor) }) else {
++            return false
++        }
++
++        window.setFrameOrigin(CGPoint(
++            x: cursor.x - window.frame.width / 2,
++            y: cursor.y - window.frame.height / 2
++        ))
++        return true
++    }
++
++    private func loadFrame(_ index: Int) -> NSImage? {
++        guard let clipID,
++              FileManager.default.fileExists(atPath: frameURL(clipID: clipID, index: index).path) else {
++            return nil
++        }
++        if let image = frameCache[index] { return image }
++        guard let image = loadImage(clipID: clipID, index: index) else { return nil }
++
++        frameCache[index] = image
++        cacheOrder.append(index)
++        if cacheOrder.count > cacheLimit {
++            frameCache.removeValue(forKey: cacheOrder.removeFirst())
++        }
++        return image
++    }
++
++    private func loadImage(clipID: String, index: Int) -> NSImage? {
++        guard index > 0 else { return nil }
++        let url = frameURL(clipID: clipID, index: index)
++        guard FileManager.default.fileExists(atPath: url.path),
++              let image = NSImage(contentsOf: url),
++              image.size.width.isFinite,
++              image.size.height.isFinite,
++              image.size.width > 0,
++              image.size.height > 0 else {
++            return nil
++        }
++        return image
++    }
++
++    private func frameURL(clipID: String, index: Int) -> URL {
++        let filename = String(format: "%05d.png", index)
++        return AppPaths.clipsRoot
++            .appendingPathComponent(clipID, isDirectory: true)
++            .appendingPathComponent("frames", isDirectory: true)
++            .appendingPathComponent(filename)
++    }
++
++    private func failActiveOverlay() {
++        guard isActive else { return }
++        let failure = onFailure
++        stop()
++        failure?()
++    }
++}
++
++private final class CursorPreyOverlayWindow: NSWindow {
++    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
++        frameRect
++    }
++}
+diff --git a/Sources/DesktopPetCore/CursorPreyPlaybackState.swift b/Sources/DesktopPetCore/CursorPreyPlaybackState.swift
+new file mode 100644
+index 0000000..a17b0e5
+--- /dev/null
++++ b/Sources/DesktopPetCore/CursorPreyPlaybackState.swift
+@@ -0,0 +1,35 @@
++import Foundation
++
++/// Deterministic loop state for a cursor-prey PNG sequence.
++public struct CursorPreyPlaybackState: Equatable {
++    public private(set) var currentFrame: Int?
++    private var frameCount = 0
++
++    public init() {}
++
++    /// Starts at frame 1. Invalid sequences leave the state stopped.
++    @discardableResult
++    public mutating func start(frameCount: Int) -> Bool {
++        stop()
++        guard frameCount > 0 else { return false }
++
++        self.frameCount = frameCount
++        currentFrame = 1
++        return true
++    }
++
++    /// Advances one frame, wrapping from the last frame to frame 1.
++    @discardableResult
++    public mutating func advance() -> Int? {
++        guard let currentFrame, frameCount > 0 else { return nil }
++
++        let nextFrame = currentFrame % frameCount + 1
++        self.currentFrame = nextFrame
++        return nextFrame
++    }
++
++    public mutating func stop() {
++        currentFrame = nil
++        frameCount = 0
++    }
++}
+diff --git a/Tests/DesktopPetTests/CursorPreyPlaybackStateTests.swift b/Tests/DesktopPetTests/CursorPreyPlaybackStateTests.swift
+new file mode 100644
+index 0000000..80ee72d
+--- /dev/null
++++ b/Tests/DesktopPetTests/CursorPreyPlaybackStateTests.swift
+@@ -0,0 +1,35 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class CursorPreyPlaybackStateTests: XCTestCase {
++    func testAdvanceLoopsFromLastFrameBackToFirst() {
++        var state = CursorPreyPlaybackState()
++
++        XCTAssertTrue(state.start(frameCount: 3))
++        XCTAssertEqual(state.currentFrame, 1)
++        XCTAssertEqual(state.advance(), 2)
++        XCTAssertEqual(state.advance(), 3)
++        XCTAssertEqual(state.advance(), 1)
++    }
++
++    func testStopMakesAdvanceHarmlessAndAllowsANewSession() {
++        var state = CursorPreyPlaybackState()
++
++        XCTAssertTrue(state.start(frameCount: 2))
++        state.stop()
++        state.stop()
++        XCTAssertNil(state.advance())
++
++        XCTAssertTrue(state.start(frameCount: 1))
++        XCTAssertEqual(state.currentFrame, 1)
++        XCTAssertEqual(state.advance(), 1)
++    }
++
++    func testStartRejectsAnEmptyFrameSequence() {
++        var state = CursorPreyPlaybackState()
++
++        XCTAssertFalse(state.start(frameCount: 0))
++        XCTAssertNil(state.currentFrame)
++        XCTAssertNil(state.advance())
++    }
++}
+

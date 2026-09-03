@@ -1,0 +1,801 @@
+# Review package: adedcf4..aa63242
+
+## Commits
+aa63242 [电源] 接入空闲显示保护与魔性阶段计时
+3f04347 [设置] 保留关闭的空闲展示延迟
+27567dc [设置] 保存空闲展示选项并增加控制项
+d12dfa8 [电源] 新增显示休眠断言租约状态机
+c15e543 [展示] 新增空闲魔性阶段策略
+
+## Files changed
+ Package.swift                                      |  3 +-
+ .../IOKitIdleDisplaySleepController.swift          | 42 ++++++++++
+ Sources/DesktopPetCore/IdleDisplaySleepLease.swift | 31 ++++++++
+ .../DesktopPetCore/IdlePresentationPolicy.swift    | 69 +++++++++++++++++
+ .../IdleDisplaySleepLeaseTests.swift               | 44 +++++++++++
+ .../IdlePresentationPolicyTests.swift              | 89 ++++++++++++++++++++++
+ 6 files changed, 277 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/Package.swift b/Package.swift
+index 466e9c7..6cbe349 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -11,20 +11,21 @@ let package = Package(
+         .target(
+             name: "DesktopPetCore",
+             path: "Sources/DesktopPetCore"
+         ),
+         .executableTarget(
+             name: "DesktopPet",
+             dependencies: ["DesktopPetCore"],
+             path: "Sources/DesktopPet",
+             linkerSettings: [
+                 .linkedFramework("ServiceManagement"),
+-                .linkedFramework("Carbon")
++                .linkedFramework("Carbon"),
++                .linkedFramework("IOKit")
+             ]
+         ),
+         .testTarget(
+             name: "DesktopPetTests",
+             dependencies: ["DesktopPetCore"],
+             path: "Tests/DesktopPetTests"
+         )
+     ]
+ )
+diff --git a/Sources/DesktopPet/IOKitIdleDisplaySleepController.swift b/Sources/DesktopPet/IOKitIdleDisplaySleepController.swift
+new file mode 100644
+index 0000000..4376999
+--- /dev/null
++++ b/Sources/DesktopPet/IOKitIdleDisplaySleepController.swift
+@@ -0,0 +1,42 @@
++import Foundation
++import IOKit.pwr_mgt
++import DesktopPetCore
++
++struct IOKitPowerAssertionError: LocalizedError {
++    let operation: String
++    let code: IOReturn
++
++    var errorDescription: String? {
++        "\(operation)失败（系统错误码 \(code)）"
++    }
++}
++
++final class IOKitIdleDisplaySleepController {
++    private lazy var lease = IdleDisplaySleepLease(
++        acquire: {
++            var id = IOPMAssertionID(0)
++            let result = IOPMAssertionCreateWithName(
++                kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
++                IOPMAssertionLevel(kIOPMAssertionLevelOn),
++                "DesktopPet 用户已启用显示保护" as CFString,
++                &id
++            )
++            guard result == kIOReturnSuccess else {
++                throw IOKitPowerAssertionError(operation: "创建显示保护", code: result)
++            }
++            return id
++        },
++        release: { id in
++            let result = IOPMAssertionRelease(id)
++            guard result == kIOReturnSuccess else {
++                throw IOKitPowerAssertionError(operation: "释放显示保护", code: result)
++            }
++        }
++    )
++
++    var isEnabled: Bool { lease.isEnabled }
++
++    func setEnabled(_ enabled: Bool) throws {
++        try lease.setEnabled(enabled)
++    }
++}
+diff --git a/Sources/DesktopPetCore/IdleDisplaySleepLease.swift b/Sources/DesktopPetCore/IdleDisplaySleepLease.swift
+new file mode 100644
+index 0000000..c988132
+--- /dev/null
++++ b/Sources/DesktopPetCore/IdleDisplaySleepLease.swift
+@@ -0,0 +1,31 @@
++public final class IdleDisplaySleepLease {
++    public typealias Acquire = () throws -> UInt32
++    public typealias Release = (UInt32) throws -> Void
++
++    private let acquire: Acquire
++    private let release: Release
++    private var assertionID: UInt32?
++
++    public var isEnabled: Bool { assertionID != nil }
++
++    public init(acquire: @escaping Acquire, release: @escaping Release) {
++        self.acquire = acquire
++        self.release = release
++    }
++
++    public func setEnabled(_ enabled: Bool) throws {
++        if enabled {
++            guard assertionID == nil else { return }
++            assertionID = try acquire()
++        } else {
++            guard let id = assertionID else { return }
++            assertionID = nil
++            try release(id)
++        }
++    }
++
++    deinit {
++        guard let id = assertionID else { return }
++        try? release(id)
++    }
++}
+diff --git a/Sources/DesktopPetCore/IdlePresentationPolicy.swift b/Sources/DesktopPetCore/IdlePresentationPolicy.swift
+new file mode 100644
+index 0000000..25e236c
+--- /dev/null
++++ b/Sources/DesktopPetCore/IdlePresentationPolicy.swift
+@@ -0,0 +1,69 @@
++import Foundation
++
++public enum IdlePresentationPhase: Equatable, Sendable {
++    case normal
++    case manic
++}
++
++public struct PersistedIdleDelay: Codable, Equatable, Sendable {
++    public var value: TimeInterval?
++
++    public init(value: TimeInterval?) {
++        self.value = value
++    }
++
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.singleValueContainer()
++        value = container.decodeNil() ? nil : try container.decode(TimeInterval.self)
++    }
++
++    public func encode(to encoder: Encoder) throws {
++        var container = encoder.singleValueContainer()
++        if let value {
++            try container.encode(value)
++        } else {
++            try container.encodeNil()
++        }
++    }
++}
++
++public enum IdlePresentationPolicy {
++    public static let supportedIdleDelays: [TimeInterval] = [60, 180, 300, 600, 900, 1800]
++    public static let defaultIdleDelay: TimeInterval = 300
++    public static let minimumManicScale = 1.0
++    public static let maximumManicScale = 3.0
++    public static let defaultManicScale = 2.0
++
++    public static func resolvedIdleDelay(
++        storedValue: TimeInterval?,
++        keyWasPresent: Bool
++    ) -> TimeInterval? {
++        guard keyWasPresent else { return defaultIdleDelay }
++        guard let storedValue else { return nil }
++        return supportedIdleDelays.contains(storedValue) ? storedValue : defaultIdleDelay
++    }
++
++    public static func clampedManicScale(_ scale: Double) -> Double {
++        guard scale.isFinite else { return defaultManicScale }
++        return min(maximumManicScale, max(minimumManicScale, scale))
++    }
++
++    public static func resolvedManicScale(_ storedValue: Double?) -> Double {
++        clampedManicScale(storedValue ?? defaultManicScale)
++    }
++
++    public static func phase(
++        idleSeconds: TimeInterval,
++        delay: TimeInterval?
++    ) -> IdlePresentationPhase {
++        guard idleSeconds.isFinite, idleSeconds >= 0, let delay else { return .normal }
++        return idleSeconds >= delay ? .manic : .normal
++    }
++
++    public static func presentationMultiplier(
++        manicScale: Double,
++        phase: IdlePresentationPhase
++    ) -> Double {
++        phase == .manic ? clampedManicScale(manicScale) : 1
++    }
++}
+diff --git a/Tests/DesktopPetTests/IdleDisplaySleepLeaseTests.swift b/Tests/DesktopPetTests/IdleDisplaySleepLeaseTests.swift
+new file mode 100644
+index 0000000..ab9eaf3
+--- /dev/null
++++ b/Tests/DesktopPetTests/IdleDisplaySleepLeaseTests.swift
+@@ -0,0 +1,44 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class IdleDisplaySleepLeaseTests: XCTestCase {
++    private enum TestError: Error { case failed }
++
++    func testEnableAndDisableAreIdempotent() throws {
++        var acquireCount = 0
++        var released: [UInt32] = []
++        let lease = IdleDisplaySleepLease(
++            acquire: { acquireCount += 1; return 42 },
++            release: { released.append($0) }
++        )
++
++        try lease.setEnabled(true)
++        try lease.setEnabled(true)
++        XCTAssertTrue(lease.isEnabled)
++        XCTAssertEqual(acquireCount, 1)
++
++        try lease.setEnabled(false)
++        try lease.setEnabled(false)
++        XCTAssertFalse(lease.isEnabled)
++        XCTAssertEqual(released, [42])
++    }
++
++    func testFailedAcquireDoesNotClaimEnabled() {
++        let lease = IdleDisplaySleepLease(
++            acquire: { throw TestError.failed },
++            release: { _ in }
++        )
++        XCTAssertThrowsError(try lease.setEnabled(true))
++        XCTAssertFalse(lease.isEnabled)
++    }
++
++    func testFailedReleaseClearsLocalLeaseState() throws {
++        let lease = IdleDisplaySleepLease(
++            acquire: { 7 },
++            release: { _ in throw TestError.failed }
++        )
++        try lease.setEnabled(true)
++        XCTAssertThrowsError(try lease.setEnabled(false))
++        XCTAssertFalse(lease.isEnabled)
++    }
++}
+diff --git a/Tests/DesktopPetTests/IdlePresentationPolicyTests.swift b/Tests/DesktopPetTests/IdlePresentationPolicyTests.swift
+new file mode 100644
+index 0000000..294333d
+--- /dev/null
++++ b/Tests/DesktopPetTests/IdlePresentationPolicyTests.swift
+@@ -0,0 +1,89 @@
++import XCTest
++@testable import DesktopPetCore
++
++final class IdlePresentationPolicyTests: XCTestCase {
++    func testSupportedDelaysAndLegacyDefaultAreExact() {
++        XCTAssertEqual(IdlePresentationPolicy.supportedIdleDelays, [60, 180, 300, 600, 900, 1800])
++        XCTAssertEqual(
++            IdlePresentationPolicy.resolvedIdleDelay(storedValue: nil, keyWasPresent: false),
++            300
++        )
++        XCTAssertNil(IdlePresentationPolicy.resolvedIdleDelay(storedValue: nil, keyWasPresent: true))
++        XCTAssertEqual(
++            IdlePresentationPolicy.resolvedIdleDelay(storedValue: 123, keyWasPresent: true),
++            300
++        )
++    }
++
++    func testPhaseUsesThresholdAndTreatsInvalidIdleAsZero() {
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: 299.9, delay: 300), .normal)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: 300, delay: 300), .manic)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: 900, delay: nil), .normal)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: .nan, delay: 300), .normal)
++        XCTAssertEqual(IdlePresentationPolicy.phase(idleSeconds: -1, delay: 300), .normal)
++    }
++
++    func testManicScaleClampsAndProducesPresentationMultiplier() {
++        XCTAssertEqual(IdlePresentationPolicy.clampedManicScale(.nan), 2)
++        XCTAssertEqual(IdlePresentationPolicy.clampedManicScale(0.5), 1)
++        XCTAssertEqual(IdlePresentationPolicy.clampedManicScale(4), 3)
++        XCTAssertEqual(
++            IdlePresentationPolicy.presentationMultiplier(manicScale: 2.5, phase: .normal),
++            1
++        )
++        XCTAssertEqual(
++            IdlePresentationPolicy.presentationMultiplier(manicScale: 2.5, phase: .manic),
++            2.5
++        )
++    }
++
++    func testPersistedManicScaleUsesSafeDefaultAndBounds() {
++        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(nil), 2)
++        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(.nan), 2)
++        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(0.5), 1)
++        XCTAssertEqual(IdlePresentationPolicy.resolvedManicScale(4), 3)
++    }
++
++    func testPersistedIdleDelayDecodesExplicitNullAsNil() throws {
++        let decoded = try JSONDecoder().decode(
++            PersistedIdleDelayFixture.self,
++            from: Data(#"{"manicIdleDelay":null}"#.utf8)
++        )
++
++        XCTAssertNil(decoded.manicIdleDelay)
++    }
++
++    func testPersistedIdleDelayEncodesNilWithExplicitNullKey() throws {
++        let encoded = try JSONEncoder().encode(PersistedIdleDelayFixture(manicIdleDelay: nil))
++        let json = try XCTUnwrap(
++            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
++        )
++
++        XCTAssertTrue(json.keys.contains("manicIdleDelay"))
++        XCTAssertTrue(json["manicIdleDelay"] is NSNull)
++    }
++
++    func testPersistedIdleDelayRoundTripKeepsClosedState() throws {
++        let encoded = try JSONEncoder().encode(PersistedIdleDelayFixture(manicIdleDelay: nil))
++        let decoded = try JSONDecoder().decode(PersistedIdleDelayFixture.self, from: encoded)
++
++        XCTAssertNil(decoded.manicIdleDelay)
++    }
++}
++
++private struct PersistedIdleDelayFixture: Codable {
++    private var manicIdleDelayStorage: PersistedIdleDelay
++
++    var manicIdleDelay: TimeInterval? {
++        get { manicIdleDelayStorage.value }
++        set { manicIdleDelayStorage = PersistedIdleDelay(value: newValue) }
++    }
++
++    private enum CodingKeys: String, CodingKey {
++        case manicIdleDelayStorage = "manicIdleDelay"
++    }
++
++    init(manicIdleDelay: TimeInterval?) {
++        manicIdleDelayStorage = PersistedIdleDelay(value: manicIdleDelay)
++    }
++}
+--- before/Models.swift
++++ after/Models.swift
+@@ -89,12 +89,16 @@
+         tags.contains(ClipTag.cursorPrey) ? .cursorTargets : .cats
+     }
+ 
+-    func effectiveDisplaySize(globalScale: Double) -> CGSize {
++    func effectiveDisplaySize(
++        globalScale: Double,
++        presentationMultiplier: Double = 1
++    ) -> CGSize {
+         PetClipPresentationPolicy.displaySize(
+             width: displayWidth,
+             height: displayHeight,
+             clipScale: clipScale,
+-            globalScale: globalScale
++            globalScale: globalScale,
++            presentationMultiplier: presentationMultiplier
+         )
+     }
+ 
+@@ -202,6 +206,13 @@
+     var petScale: Double
+     var alwaysOnTop: Bool
+     var clickThrough: Bool
++    var preventIdleDisplaySleep: Bool
++    private var manicIdleDelayStorage: PersistedIdleDelay
++    var manicIdleDelay: TimeInterval? {
++        get { manicIdleDelayStorage.value }
++        set { manicIdleDelayStorage = PersistedIdleDelay(value: newValue) }
++    }
++    var manicScale: Double
+     /// Similarity threshold 0...1 for auto transition edges.
+     var autoLinkThreshold: Double
+     var autoLinkEnabled: Bool
+@@ -218,6 +229,9 @@
+         petScale: 1.0,
+         alwaysOnTop: true,
+         clickThrough: false,
++        preventIdleDisplaySleep: false,
++        manicIdleDelay: IdlePresentationPolicy.defaultIdleDelay,
++        manicScale: IdlePresentationPolicy.defaultManicScale,
+         autoLinkThreshold: 0.82,
+         autoLinkEnabled: true,
+         activeQueue: [],
+@@ -238,6 +252,9 @@
+ 
+     enum CodingKeys: String, CodingKey {
+         case clips, playbackMode, petScale, alwaysOnTop, clickThrough
++        case preventIdleDisplaySleep
++        case manicIdleDelayStorage = "manicIdleDelay"
++        case manicScale
+         case autoLinkThreshold, autoLinkEnabled, activeQueue
+         case teleportEnabled, teleportFrequency, cursorNudgeEnabled, reminderMessages
+     }
+@@ -248,6 +265,9 @@
+         petScale: Double,
+         alwaysOnTop: Bool,
+         clickThrough: Bool,
++        preventIdleDisplaySleep: Bool,
++        manicIdleDelay: TimeInterval?,
++        manicScale: Double,
+         autoLinkThreshold: Double,
+         autoLinkEnabled: Bool,
+         activeQueue: [String],
+@@ -261,6 +281,9 @@
+         self.petScale = petScale
+         self.alwaysOnTop = alwaysOnTop
+         self.clickThrough = clickThrough
++        self.preventIdleDisplaySleep = preventIdleDisplaySleep
++        self.manicIdleDelayStorage = PersistedIdleDelay(value: manicIdleDelay)
++        self.manicScale = IdlePresentationPolicy.resolvedManicScale(manicScale)
+         self.autoLinkThreshold = autoLinkThreshold
+         self.autoLinkEnabled = autoLinkEnabled
+         self.activeQueue = activeQueue
+@@ -277,6 +300,21 @@
+         petScale = try c.decode(Double.self, forKey: .petScale)
+         alwaysOnTop = try c.decode(Bool.self, forKey: .alwaysOnTop)
+         clickThrough = try c.decode(Bool.self, forKey: .clickThrough)
++        preventIdleDisplaySleep = try c.decodeIfPresent(Bool.self, forKey: .preventIdleDisplaySleep)
++            ?? false
++        let manicIdleDelayKeyWasPresent = c.contains(.manicIdleDelayStorage)
++        let storedManicIdleDelay = manicIdleDelayKeyWasPresent
++            ? try c.decode(PersistedIdleDelay.self, forKey: .manicIdleDelayStorage).value
++            : nil
++        manicIdleDelayStorage = PersistedIdleDelay(
++            value: IdlePresentationPolicy.resolvedIdleDelay(
++                storedValue: storedManicIdleDelay,
++                keyWasPresent: manicIdleDelayKeyWasPresent
++            )
++        )
++        manicScale = IdlePresentationPolicy.resolvedManicScale(
++            try c.decodeIfPresent(Double.self, forKey: .manicScale)
++        )
+         autoLinkThreshold = try c.decode(Double.self, forKey: .autoLinkThreshold)
+         autoLinkEnabled = try c.decode(Bool.self, forKey: .autoLinkEnabled)
+         activeQueue = try c.decodeIfPresent([String].self, forKey: .activeQueue) ?? []
+--- before/LibraryWindowController.swift
++++ after/LibraryWindowController.swift
+@@ -25,6 +25,14 @@
+     private let topToggle = NSButton(checkboxWithTitle: "置顶", target: nil, action: nil)
+     private let clickToggle = NSButton(checkboxWithTitle: "点击穿透", target: nil, action: nil)
+     private let launchAtLoginToggle = NSButton(checkboxWithTitle: "开机启动", target: nil, action: nil)
++    private let preventIdleDisplaySleepToggle = NSButton(
++        checkboxWithTitle: "阻止自动锁屏与关闭屏幕",
++        target: nil,
++        action: nil
++    )
++    private let manicIdleDelayPopup = NSPopUpButton()
++    private let manicScaleSlider = NSSlider()
++    private let manicScaleValueLabel = NSTextField(labelWithString: "2.0×")
+     private let autoLinkToggle = NSButton(checkboxWithTitle: "自动衔接", target: nil, action: nil)
+     private let thresholdSlider = NSSlider()
+     private let teleportToggle = NSButton(checkboxWithTitle: "随机隐现", target: nil, action: nil)
+@@ -430,6 +438,46 @@
+         row3.addArrangedSubview(cursorNudgeToggle)
+         row3.addArrangedSubview(editRemindersButton)
+         row3.addArrangedSubview(NSView())
++
++        let row4 = NSStackView()
++        row4.orientation = .horizontal
++        row4.spacing = 12
++        preventIdleDisplaySleepToggle.target = self
++        preventIdleDisplaySleepToggle.action = #selector(idlePresentationSettingsChanged)
++        let idleDelayLabel = NSTextField(labelWithString: "空闲狂暴展示")
++        manicIdleDelayPopup.removeAllItems()
++        let idleDelayOptions: [(title: String, seconds: TimeInterval?)] = [
++            ("关闭", nil),
++            ("1 分钟", 60),
++            ("3 分钟", 180),
++            ("5 分钟", 300),
++            ("10 分钟", 600),
++            ("15 分钟", 900),
++            ("30 分钟", 1800)
++        ]
++        for option in idleDelayOptions {
++            manicIdleDelayPopup.addItem(withTitle: option.title)
++            manicIdleDelayPopup.lastItem?.representedObject = option.seconds.map(NSNumber.init(value:))
++                ?? NSNull()
++        }
++        manicIdleDelayPopup.target = self
++        manicIdleDelayPopup.action = #selector(idlePresentationSettingsChanged)
++        let manicScaleLabel = NSTextField(labelWithString: "展示倍率")
++        manicScaleSlider.minValue = IdlePresentationPolicy.minimumManicScale
++        manicScaleSlider.maxValue = IdlePresentationPolicy.maximumManicScale
++        manicScaleSlider.doubleValue = store.state.manicScale
++        manicScaleSlider.target = self
++        manicScaleSlider.action = #selector(idlePresentationSettingsChanged)
++        manicScaleSlider.widthAnchor.constraint(equalToConstant: 140).isActive = true
++        manicScaleValueLabel.alignment = .right
++        manicScaleValueLabel.widthAnchor.constraint(equalToConstant: 36).isActive = true
++        row4.addArrangedSubview(preventIdleDisplaySleepToggle)
++        row4.addArrangedSubview(idleDelayLabel)
++        row4.addArrangedSubview(manicIdleDelayPopup)
++        row4.addArrangedSubview(manicScaleLabel)
++        row4.addArrangedSubview(manicScaleSlider)
++        row4.addArrangedSubview(manicScaleValueLabel)
++        row4.addArrangedSubview(NSView())
+ 
+         let launchHint = NSTextField(wrappingLabelWithString: "「开机启动」会在登录时自动打开桌面宠物。若提示需要批准，请到 系统设置 → 通用 → 登录项 中允许。")
+         launchHint.textColor = .secondaryLabelColor
+@@ -439,6 +487,7 @@
+         col.addArrangedSubview(row1)
+         col.addArrangedSubview(row2)
+         col.addArrangedSubview(row3)
++        col.addArrangedSubview(row4)
+         col.addArrangedSubview(launchHint)
+         wrap.addSubview(col)
+ 
+@@ -452,7 +501,7 @@
+             col.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -12),
+             col.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -10),
+ 
+-            wrap.heightAnchor.constraint(equalToConstant: 150)
++            wrap.heightAnchor.constraint(equalToConstant: 184)
+         ])
+         return wrap
+     }
+@@ -498,6 +547,20 @@
+         topToggle.state = store.state.alwaysOnTop ? .on : .off
+         clickToggle.state = store.state.clickThrough ? .on : .off
+         launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
++        preventIdleDisplaySleepToggle.state = store.state.preventIdleDisplaySleep ? .on : .off
++        let selectedDelayIndex = manicIdleDelayPopup.itemArray.firstIndex { item in
++            if let representedDelay = item.representedObject as? NSNumber,
++               let storedDelay = store.state.manicIdleDelay {
++                return representedDelay.doubleValue == storedDelay
++            }
++            return item.representedObject is NSNull && store.state.manicIdleDelay == nil
++        }
++        if let selectedDelayIndex {
++            manicIdleDelayPopup.selectItem(at: selectedDelayIndex)
++        }
++        manicScaleSlider.doubleValue = store.state.manicScale
++        manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
++        manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
+         autoLinkToggle.state = store.state.autoLinkEnabled ? .on : .off
+         scaleSlider.doubleValue = store.state.petScale
+         thresholdSlider.doubleValue = store.state.autoLinkThreshold
+@@ -939,6 +1002,29 @@
+         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
+     }
+ 
++    @objc private func idlePresentationSettingsChanged() {
++        let delay = (manicIdleDelayPopup.selectedItem?.representedObject as? NSNumber)?.doubleValue
++        store.update {
++            $0.preventIdleDisplaySleep = preventIdleDisplaySleepToggle.state == .on
++            $0.manicIdleDelay = delay
++            $0.manicScale = IdlePresentationPolicy.clampedManicScale(manicScaleSlider.doubleValue)
++        }
++        manicScaleValueLabel.stringValue = String(format: "%.1f×", store.state.manicScale)
++        manicScaleSlider.isEnabled = store.state.manicIdleDelay != nil
++        NotificationCenter.default.post(name: .libraryDidChange, object: nil)
++    }
++
++    func presentIdleDisplaySleepError(_ message: String) {
++        let alert = NSAlert()
++        alert.messageText = "无法阻止自动关闭屏幕"
++        alert.informativeText = message
++        if let window, window.isVisible {
++            alert.beginSheetModal(for: window)
++        } else {
++            alert.runModal()
++        }
++    }
++
+     @objc private func autoLinkChanged() {
+         store.update { $0.autoLinkEnabled = autoLinkToggle.state == .on }
+         if store.state.autoLinkEnabled {
+--- before/PetClipPresentationPolicy.swift
++++ after/PetClipPresentationPolicy.swift
+@@ -79,12 +79,14 @@
+         width: Int,
+         height: Int,
+         clipScale: Double,
+-        globalScale: Double
++        globalScale: Double,
++        presentationMultiplier: Double = 1
+     ) -> CGSize {
+-        let scale = effectiveScale(clipScale: clipScale, globalScale: globalScale)
++        let normalScale = effectiveScale(clipScale: clipScale, globalScale: globalScale)
++        let extraScale = presentationMultiplier.isFinite ? max(1, presentationMultiplier) : 1
+         return CGSize(
+-            width: CGFloat(max(0, width)) * scale,
+-            height: CGFloat(max(0, height)) * scale
++            width: CGFloat(max(0, width)) * normalScale * extraScale,
++            height: CGFloat(max(0, height)) * normalScale * extraScale
+         )
+     }
+ 
+--- before/PetClipPresentationPolicyTests.swift
++++ after/PetClipPresentationPolicyTests.swift
+@@ -21,6 +21,18 @@
+         XCTAssertEqual(size.height, 192.0, accuracy: 0.0001)
+     }
+ 
++    func testDisplaySizeAppliesPresentationMultiplierAfterNormalScale() {
++        let size = PetClipPresentationPolicy.displaySize(
++            width: 100,
++            height: 50,
++            clipScale: 0.8,
++            globalScale: 1.5,
++            presentationMultiplier: 2
++        )
++        XCTAssertEqual(size.width, 240, accuracy: 0.0001)
++        XCTAssertEqual(size.height, 120, accuracy: 0.0001)
++    }
++
+     func testTabsSeparateOnlyCursorPreyFromCats() {
+         let entries = [
+             ClipLibraryEntry(id: "ordinary", isCursorPrey: false),
+--- before/PetWindowController.swift
++++ after/PetWindowController.swift
+@@ -111,6 +111,7 @@
+     private var frameCache: (clipID: String, index: Int, image: NSImage)?
+     private var petDisplaySize: CGSize = .zero
+     private var effectPadding: CGFloat = 0
++    private(set) var idlePresentationPhase: IdlePresentationPhase = .normal
+ 
+     var onTeleportDragCancel: (() -> Void)?
+     /// Quick click on the cat — petting.
+@@ -210,6 +211,22 @@
+         window?.frame ?? .zero
+     }
+ 
++    func setIdlePresentationPhase(_ phase: IdlePresentationPhase) {
++        guard idlePresentationPhase != phase else { return }
++        idlePresentationPhase = phase
++        refreshFrame()
++    }
++
++    func effectiveDisplaySize(for clip: PetClip) -> CGSize {
++        clip.effectiveDisplaySize(
++            globalScale: store.state.petScale,
++            presentationMultiplier: IdlePresentationPolicy.presentationMultiplier(
++                manicScale: store.state.manicScale,
++                phase: idlePresentationPhase
++            )
++        )
++    }
++
+     /// Snapshot of the current pet image (for the tile-swarm journey).
+     func petSnapshot() -> CGImage? {
+         guard let rep = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) else {
+@@ -362,7 +379,7 @@
+             return
+         }
+ 
+-        let displaySize = clip.effectiveDisplaySize(globalScale: store.state.petScale)
++        let displaySize = effectiveDisplaySize(for: clip)
+         let w = displaySize.width
+         let h = displaySize.height
+         petDisplaySize = displaySize
+@@ -375,8 +392,14 @@
+             let bottom = frame.minY
+             let centerX = frame.midX
+             frame.size = NSSize(width: w + effectPadding * 2, height: h + effectPadding * 2)
+-            frame.origin.x = centerX - frame.size.width / 2
+-            frame.origin.y = bottom
++            frame.origin = CGPoint(x: centerX - frame.width / 2, y: bottom)
++            if let visibleFrame = (window.screen ?? NSScreen.main)?.visibleFrame {
++                frame.origin = TeleportMath.clampOrigin(
++                    frame.origin,
++                    petSize: frame.size,
++                    visibleFrame: visibleFrame
++                )
++            }
+             window.setFrame(frame, display: true)
+         }
+ 
+--- before/TeleportController.swift
++++ after/TeleportController.swift
+@@ -422,7 +422,7 @@
+     private func placeLandingFrame() {
+         guard let clipID = engine.currentClipID,
+               let clip = store.clip(id: clipID) else { return }
+-        let size = clip.effectiveDisplaySize(globalScale: store.state.petScale)
++        let size = pet.effectiveDisplaySize(for: clip)
+         pet.setTeleportLandingFrame(center: travelTo, size: size)
+     }
+ 
+--- before/AppDelegate.swift
++++ after/AppDelegate.swift
+@@ -29,6 +29,10 @@
+     private var syncTimer: Timer?
+     private var lastRendered: (String?, Int) = (nil, -1)
+     private var wasImporting = false
++    private let idleDisplaySleepController = IOKitIdleDisplaySleepController()
++    private var idlePresentationTimer: Timer?
++    private var currentIdlePresentationPhase: IdlePresentationPhase = .normal
++    private var isRecoveringDisplaySleepSetting = false
+ 
+     func applicationDidFinishLaunching(_ notification: Notification) {
+         engine.attach(store: store)
+@@ -66,7 +70,18 @@
+ 
+         setupStatusItem()
+         openLibrary()
++        synchronizeIdleDisplaySleep()
++        updateIdlePresentation()
+ 
++        idlePresentationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
++            Task { @MainActor in
++                self?.updateIdlePresentation()
++            }
++        }
++        if let idlePresentationTimer {
++            RunLoop.main.add(idlePresentationTimer, forMode: .common)
++        }
++
+         syncTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+             Task { @MainActor in
+                 self?.syncPetFrame()
+@@ -134,6 +149,8 @@
+     private func handleLibraryChange() {
+         teleportController?.syncFromStore()
+         petWindow?.applyWindowFlags()
++        synchronizeIdleDisplaySleep()
++        updateIdlePresentation()
+         if engine.currentClipID == nil, let id = store.state.playableClips.first?.id {
+             engine.playClip(id: id)
+         } else if let id = engine.currentClipID, store.clip(id: id) == nil {
+@@ -165,6 +182,33 @@
+         }
+     }
+ 
++    private func synchronizeIdleDisplaySleep() {
++        guard !isRecoveringDisplaySleepSetting else { return }
++        do {
++            try idleDisplaySleepController.setEnabled(store.state.preventIdleDisplaySleep)
++        } catch {
++            isRecoveringDisplaySleepSetting = true
++            store.update { $0.preventIdleDisplaySleep = false }
++            isRecoveringDisplaySleepSetting = false
++            libraryWindow?.presentIdleDisplaySleepError(error.localizedDescription)
++            NotificationCenter.default.post(name: .libraryDidChange, object: nil)
++        }
++    }
++
++    private func updateIdlePresentation() {
++        let rawIdle = CGEventSource.secondsSinceLastEventType(
++            .hidSystemState,
++            eventType: .null
++        )
++        let phase = IdlePresentationPolicy.phase(
++            idleSeconds: rawIdle,
++            delay: store.state.manicIdleDelay
++        )
++        guard phase != currentIdlePresentationPhase else { return }
++        currentIdlePresentationPhase = phase
++        petWindow?.setIdlePresentationPhase(phase)
++    }
++
+     private func syncPetFrame() {
+         let key = (engine.currentClipID, engine.currentFrameIndex)
+         guard key != lastRendered else { return }
+@@ -305,6 +349,21 @@
+ 
+     @objc func quit() {
+         teleportController?.stop()
++        do {
++            try idleDisplaySleepController.setEnabled(false)
++        } catch {
++            NSLog("DesktopPet: %@", error.localizedDescription)
++        }
+         NSApp.terminate(nil)
+     }
++
++    func applicationWillTerminate(_ notification: Notification) {
++        idlePresentationTimer?.invalidate()
++        idlePresentationTimer = nil
++        do {
++            try idleDisplaySleepController.setEnabled(false)
++        } catch {
++            NSLog("DesktopPet: %@", error.localizedDescription)
++        }
++    }
+ }
+--- before/README.md
++++ after/README.md
+@@ -14,6 +14,9 @@
+ - **大小**：缩放约 0.4×–2.2×
+ - 跟随全部 Spaces / 全屏辅助空间
+ - 片段尺寸不同时以**底边中心**为锚点换装：脚保持落地，不跳位
++- **阻止自动锁屏与关闭屏幕**：使用 macOS 显示空闲休眠断言保持屏幕常亮；不会阻止 `⌃⌘Q`、系统菜单锁屏、合盖或主动睡眠。
++- 独立的屏幕保护程序、组织 MDM 或其他安全策略仍会照常生效，本功能不会尝试绕过它们。
++- **空闲魔性展示**：可在 1/3/5/10/15/30 分钟无键鼠输入后，将猫猫按 1.0×–3.0× 额外放大；真实输入后立即恢复正常大小。
+ 
+ ### 互动
+ 
