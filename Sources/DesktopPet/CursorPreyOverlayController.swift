@@ -13,6 +13,8 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
     private let cacheLimit = 24
     private var window: NSWindow?
     private var imageView: NSImageView?
+    private let video = AlphaVideoPlayback()
+    private var videoFrameCount = 1
     private var driverTimer: Timer?
     private var playback = CursorPreyPlaybackState()
     private var clipID: String?
@@ -62,6 +64,7 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
         self.imageView = imageView
         clipID = clip.id
         fps = clip.fps
+        videoFrameCount = clip.frameCount
         frameCache[1] = firstImage
         cacheOrder = [1]
         guard playback.start(frameCount: clip.frameCount),
@@ -98,6 +101,7 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
 
     /// Stops the overlay and restores the pointer only if this controller hid it.
     func stop() {
+        video.stop()
         sessionRevision &+= 1
         driverTimer?.invalidate()
         driverTimer = nil
@@ -211,13 +215,19 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
         let elapsed = now - lastDriverTickTime
         guard elapsed.isFinite, elapsed > 0,
               let nextFrame = playback.advance(elapsed: elapsed, fps: fps),
-              let image = loadFrame(nextFrame),
               positionWindowAtCursor() else {
             failActiveOverlay()
             return
         }
         self.lastDriverTickTime = now
-        imageView.image = image
+        if let clipID, video.display(id: clipID, frame: nextFrame, frameCount: videoFrameCount,
+                                    fps: fps, in: imageView, rect: imageView.bounds) {
+            imageView.image = nil
+        } else if let image = loadFrame(nextFrame) {
+            imageView.image = image
+        } else {
+            failActiveOverlay()
+        }
     }
 
     private func beginForegroundCursorHide(for revision: UInt) -> Bool {
@@ -303,8 +313,7 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
     }
 
     private func loadFrame(_ index: Int) -> NSImage? {
-        guard let clipID,
-              FileManager.default.fileExists(atPath: frameURL(clipID: clipID, index: index).path) else {
+        guard let clipID else {
             return nil
         }
         if let image = frameCache[index] { return image }
@@ -320,9 +329,7 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
 
     private func loadImage(clipID: String, index: Int) -> NSImage? {
         guard index > 0 else { return nil }
-        let url = frameURL(clipID: clipID, index: index)
-        guard FileManager.default.fileExists(atPath: url.path),
-              let image = NSImage(contentsOf: url),
+        guard let image = ClipMedia.image(id: clipID, index: index, fps: fps),
               image.size.width.isFinite,
               image.size.height.isFinite,
               image.size.width > 0,

@@ -3,13 +3,28 @@ import DesktopPetCore
 
 /// Transparent pet surface: drag opaque pixels to move the floating window.
 final class PetContentView: NSView {
+    let video = AlphaVideoPlayback()
+
+    func renderedSnapshot() -> NSImage? {
+        guard let source = video.isActive ? video.snapshot() : image else { return nil }
+        let result = NSImage(size: bounds.size)
+        result.lockFocus()
+        source.draw(in: imageDrawRect, from: .zero, operation: .sourceOver, fraction: 1)
+        result.unlockFocus()
+        return result
+    }
+
     var image: NSImage? {
-        didSet { needsDisplay = true }
+        didSet {
+            if image !== oldValue { needsDisplay = true }
+        }
     }
 
     /// Logical pet size inside this view (window may be larger during FX padding).
     var petContentSize: CGSize = .zero {
-        didSet { needsDisplay = true }
+        didSet {
+            if petContentSize != oldValue { needsDisplay = true }
+        }
     }
 
     var onDragBegan: (() -> Void)?
@@ -51,7 +66,8 @@ final class PetContentView: NSView {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard image != nil, imageDrawRect.contains(point) else { return nil }
+        guard image != nil || video.isActive else { return nil }
+        guard imageDrawRect.contains(point) else { return nil }
         return self
     }
 
@@ -131,7 +147,9 @@ final class PetWindowController: NSWindowController {
 
     /// While a teleport effect owns the visuals, the live view stays blank
     /// (the effect shows the frames instead) but frames keep flowing above.
-    var suppressLiveImageForEffect = false
+    var suppressLiveImageForEffect = false {
+        didSet { contentView.video.layer.isHidden = suppressLiveImageForEffect }
+    }
 
     var effectHost: PetContentView { contentView }
 
@@ -202,6 +220,16 @@ final class PetWindowController: NSWindowController {
         fatalError("init(coder:) has not been implemented")
     }
 
+    func reloadVideo() {
+        contentView.video.stop()
+        frameCache = nil
+        refreshFrame()
+    }
+
+    func videoPlaybackTime(for id: String) -> TimeInterval? {
+        contentView.video.playbackTime(for: id)
+    }
+
     func currentPetFrame() -> CGRect {
         window?.frame ?? .zero
     }
@@ -237,11 +265,9 @@ final class PetWindowController: NSWindowController {
 
     /// Snapshot of the current pet image (for the tile-swarm journey).
     func petSnapshot() -> CGImage? {
-        guard let rep = contentView.bitmapImageRepForCachingDisplay(in: contentView.bounds) else {
-            return nil
-        }
-        contentView.cacheDisplay(in: contentView.bounds, to: rep)
-        return rep.cgImage
+        guard let image = contentView.renderedSnapshot() else { return nil }
+        var rect = CGRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
 
     func setPetHiddenForTeleport(_ hidden: Bool) {
@@ -392,6 +418,7 @@ final class PetWindowController: NSWindowController {
         guard let window,
               let id = engine.currentClipID,
               let clip = store.clip(id: id) else {
+            contentView.video.stop()
             contentView.image = nil
             return
         }
@@ -414,8 +441,18 @@ final class PetWindowController: NSWindowController {
         // During a teleport trip the controller owns geometry. A skipped
         // update is remembered and applied once after the renderer removes
         // its padding and releases the geometry freeze.
-        if geometryRefreshState.requestRefresh() {
-            window.setFrame(geometryFrame, display: true)
+        if geometryRefreshState.requestRefresh(), window.frame != geometryFrame {
+            window.setFrame(geometryFrame, display: false)
+        }
+
+        if contentView.video.display(id: id, frame: index, frameCount: clip.frameCount,
+                                     fps: clip.fps, in: contentView, rect: contentView.imageDrawRect) {
+            contentView.image = nil
+            contentView.video.layer.isHidden = suppressLiveImageForEffect
+            if suppressLiveImageForEffect, let image = contentView.video.snapshot() {
+                onFrameRendered?(image)
+            }
+            return
         }
 
         if let cache = frameCache, cache.clipID == id, cache.index == index {

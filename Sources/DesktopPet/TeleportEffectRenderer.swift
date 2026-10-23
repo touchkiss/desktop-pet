@@ -996,6 +996,11 @@ final class TeleportEffectRenderer {
     }
 
     private func snapshot(_ view: NSView) -> (NSImage, CGImage)? {
+        if let pet = view as? PetContentView, let image = pet.renderedSnapshot() {
+            var rect = CGRect(origin: .zero, size: image.size)
+            guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return nil }
+            return (image, cg)
+        }
         guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
         view.cacheDisplay(in: view.bounds, to: rep)
         guard let cg = rep.cgImage else { return nil }

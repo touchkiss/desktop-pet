@@ -18,6 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = LibraryStore()
     let engine = PlaylistEngine()
 
+    private let mediaMigration = ClipMediaMigrationController()
+    private var migrationMenuItem: NSMenuItem?
     private var statusItem: NSStatusItem?
     private var petWindow: PetWindowController?
     private var teleportController: TeleportController?
@@ -26,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let pomodoro = PomodoroController()
     private let downloadsWatcher = DownloadsWatcher()
     private var sniffMenuItem: NSMenuItem?
-    private var syncTimer: Timer?
+    private var importProgressTimer: Timer?
     private var lastRendered: (String?, Int) = (nil, -1)
     private var wasImporting = false
     private let idleDisplaySleepController = IOKitIdleDisplaySleepController()
@@ -39,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let pet = PetWindowController(store: store, engine: engine)
         petWindow = pet
+        engine.playbackTimeProvider = { [weak pet] id in pet?.videoPlaybackTime(for: id) }
         pet.showWindow(nil)
 
         let teleport = TeleportController(store: store, pet: pet, engine: engine)
@@ -69,7 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupStatusItem()
-        openLibrary()
+        if !UserDefaults.standard.bool(forKey: "minimizeWindowAfterLaunch") {
+            openLibrary()
+        }
         synchronizeIdleDisplaySleep()
         updateIdlePresentation()
 
@@ -82,14 +87,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             RunLoop.main.add(idlePresentationTimer, forMode: .common)
         }
 
-        syncTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+        engine.onFrameChanged = { [weak self] in
+            // Keep rendering outside engine mutations: a failed frame can change playback.
+            Task { @MainActor [weak self] in
                 self?.syncPetFrame()
+            }
+        }
+        syncPetFrame()
+
+        importProgressTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor in
                 self?.pollImportProgress()
             }
         }
-        if let syncTimer {
-            RunLoop.main.add(syncTimer, forMode: .common)
+        importProgressTimer?.tolerance = 0.05
+        if let importProgressTimer {
+            RunLoop.main.add(importProgressTimer, forMode: .common)
         }
 
         NotificationCenter.default.addObserver(
@@ -110,6 +123,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.handleIdlePresentationSettingsChange()
             }
         }
+
+        mediaMigration.onProgress = { [weak self] message in
+            self?.migrationMenuItem?.title = message
+        }
+        mediaMigration.onClipConverted = { [weak self] id in
+            guard let self else { return }
+            if self.engine.currentClipID == id { self.petWindow?.reloadVideo() }
+        }
+        mediaMigration.start(clips: store.state.clips)
 
         if store.state.clips.isEmpty {
             bootstrapSampleIfNeeded()
@@ -301,6 +323,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sniffMenuItem = sniff
 
         menu.addItem(.separator())
+        let migration = NSMenuItem(title: "升级旧片段为透明视频", action: #selector(retryMediaMigration), keyEquivalent: "")
+        migration.target = self
+        migrationMenuItem = migration
+        menu.addItem(migration)
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
@@ -372,6 +398,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderFront(nil)
             teleportController?.setPetVisible(true)
         }
+    }
+
+    @objc private func retryMediaMigration() {
+        mediaMigration.start(clips: store.state.clips)
     }
 
     @objc func quit() {

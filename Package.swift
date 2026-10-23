@@ -23,6 +23,11 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "DesktopPetMediaTests",
+            dependencies: ["DesktopPet"],
+            path: "Tests/DesktopPetMediaTests"
+        ),
+        .testTarget(
             name: "DesktopPetTests",
             dependencies: ["DesktopPetCore"],
             path: "Tests/DesktopPetTests"

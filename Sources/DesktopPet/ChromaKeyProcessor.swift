@@ -117,7 +117,7 @@ final class ChromaKeyProcessor: @unchecked Sendable {
         let firstFP = try FrameFingerprint.make(from: firstURL)
         let lastFP = try FrameFingerprint.make(from: lastURL)
 
-        return PetClip(
+        let clip = PetClip(
             id: clipID,
             name: name,
             sourcePath: localSourceURL.path,
@@ -130,6 +130,8 @@ final class ChromaKeyProcessor: @unchecked Sendable {
             nextClipIDs: [],
             createdAt: Date()
         )
+        try ClipMediaMigration.convert(clip, keepBackup: false)
+        return clip
     }
 
     /// Fast preview: key a few sample frames with the given settings.

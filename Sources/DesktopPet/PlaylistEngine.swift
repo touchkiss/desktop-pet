@@ -13,6 +13,11 @@ final class PlaylistEngine {
     private(set) var currentClipID: String?
     private(set) var currentFrameIndex: Int = 1
 
+    /// Delivers completed playback mutations without a separate polling timer.
+    var onFrameChanged: (() -> Void)?
+    /// Native video clock when available; legacy sequences retain timer-based advancement.
+    var playbackTimeProvider: ((String) -> TimeInterval?)?
+
     private weak var store: LibraryStore?
     private var timer: Timer?
     private var recentIDs: [String] = []
@@ -43,6 +48,7 @@ final class PlaylistEngine {
     var endingSoonLeadTime: TimeInterval = 0.75
 
     func attach(store: LibraryStore) {
+        defer { onFrameChanged?() }
         self.store = store
         if currentClipID == nil {
             advancePlaybackRevision()
@@ -83,6 +89,7 @@ final class PlaylistEngine {
     }
 
     func playClip(id: String, notifyingObservers: Bool) {
+        defer { onFrameChanged?() }
         let requestRevision = advancePlaybackRevision()
         cancelOneShot(reason: .replacedByPlayback)
         guard PlaybackRevisionPolicy.shouldAccept(
@@ -111,6 +118,7 @@ final class PlaylistEngine {
         completion: @escaping () -> Void = {},
         cancellation: @escaping (OneShotCancellationReason) -> Void = { _ in }
     ) -> Bool {
+        defer { onFrameChanged?() }
         guard holdingAtEnd,
               let store,
               let clip = store.clip(id: id),
@@ -156,6 +164,7 @@ final class PlaylistEngine {
     }
 
     func stop() {
+        defer { onFrameChanged?() }
         let requestRevision = advancePlaybackRevision()
         cancelOneShot(reason: .stopped)
         guard PlaybackRevisionPolicy.shouldAccept(
@@ -198,6 +207,7 @@ final class PlaylistEngine {
 
     /// Release a clip-end hold. If `playNext` is true, play the queued next clip (or loop).
     func resumeAfterHold(playNext: Bool = true) {
+        defer { onFrameChanged?() }
         guard holdingAtEnd else { return }
         let next = pendingNextID
         holdingAtEnd = false
@@ -218,6 +228,7 @@ final class PlaylistEngine {
     }
 
     private func tick(timerRevision: UInt) {
+        defer { onFrameChanged?() }
         guard PlaybackRevisionPolicy.shouldAccept(
             expected: timerRevision,
             current: self.timerRevision
@@ -238,7 +249,11 @@ final class PlaylistEngine {
         }
 
         if currentFrameIndex < clip.frameCount {
-            currentFrameIndex += 1
+            if let time = playbackTimeProvider?(id), time.isFinite, time >= 0 {
+                currentFrameIndex = min(clip.frameCount, max(1, Int(floor(time * clip.fps + 0.00001)) + 1))
+            } else {
+                currentFrameIndex += 1
+            }
             if !isPlayingOneShot {
                 notifyEndingSoonIfNeeded(clip: clip)
             }

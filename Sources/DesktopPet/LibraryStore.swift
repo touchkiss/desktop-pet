@@ -3,9 +3,12 @@ import AppKit
 import DesktopPetCore
 
 enum AppPaths {
+    private static let supportRootPath = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        .appendingPathComponent("DesktopPet", isDirectory: true)
+
     static var supportRoot: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let root = base.appendingPathComponent("DesktopPet", isDirectory: true)
+        let root = supportRootPath
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
     }
@@ -33,7 +36,12 @@ enum AppPaths {
     }
 
     static func frameURL(clipID: String, index: Int) -> URL {
-        framesDirectory(id: clipID).appendingPathComponent(String(format: "%05d.png", index))
+        // Reading a frame must not create directories on every playback tick.
+        supportRootPath
+            .appendingPathComponent("clips", isDirectory: true)
+            .appendingPathComponent(clipID, isDirectory: true)
+            .appendingPathComponent("frames", isDirectory: true)
+            .appendingPathComponent(String(format: "%05d.png", index))
     }
 }
 
@@ -65,6 +73,7 @@ enum FFmpegLocator {
 }
 
 final class LibraryStore {
+    private let libraryURL: URL
     private(set) var state: LibraryState
     var importProgress: ImportProgress?
     var lastError: String?
@@ -82,8 +91,9 @@ final class LibraryStore {
         return d
     }()
 
-    init() {
-        if let data = try? Data(contentsOf: AppPaths.libraryURL),
+    init(libraryURL: URL = AppPaths.libraryURL) {
+        self.libraryURL = libraryURL
+        if let data = try? Data(contentsOf: libraryURL),
            let loaded = try? decoder.decode(LibraryState.self, from: data) {
             state = loaded
         } else {
@@ -115,7 +125,7 @@ final class LibraryStore {
     func save() -> String? {
         do {
             let data = try encoder.encode(state)
-            try data.write(to: AppPaths.libraryURL, options: .atomic)
+            try data.write(to: libraryURL, options: .atomic)
             return nil
         } catch {
             let saveError = "保存失败: \(error.localizedDescription)"
@@ -312,7 +322,7 @@ final class LibraryStore {
         importProgress = ImportProgress(
             clipName: staging.displayName,
             fraction: 0.2,
-            message: "正在按预览参数导出透明帧…"
+            message: "正在抠图并生成透明视频…"
         )
 
         do {
@@ -403,6 +413,36 @@ final class LibraryStore {
             guard let index = state.clips.firstIndex(where: { $0.id == clipID }) else { return }
             state.clips[index].clipScale = PetClipPresentationPolicy.clampedClipScale(scale)
         }
+    }
+
+    /// Applies one batch atomically and refuses stale previews; playback counters may change.
+    @discardableResult
+    func applyClipScales(_ scales: [String: Double], expected: [PetClip]) -> String? {
+        let expectedByID = Dictionary(uniqueKeysWithValues: expected.map { ($0.id, $0) })
+        for snapshot in expected {
+            guard let live = clip(id: snapshot.id), live.libraryTab == .cats,
+                  live.clipScale == snapshot.clipScale,
+                  live.displayWidth == snapshot.displayWidth, live.displayHeight == snapshot.displayHeight,
+                  live.frameCount == snapshot.frameCount, live.sourcePath == snapshot.sourcePath,
+                  live.createdAt == snapshot.createdAt else {
+                return "相关片段已修改、删除或改为目标素材，请重新计算后再操作。"
+            }
+        }
+        for (id, scale) in scales {
+            guard expectedByID[id] != nil, scale.isFinite,
+                  (PetClipPresentationPolicy.minimumClipScale...PetClipPresentationPolicy.maximumClipScale).contains(scale) else {
+                return "批量倍率无效，未保存任何修改。"
+            }
+        }
+        let previous = state
+        for index in state.clips.indices {
+            if let scale = scales[state.clips[index].id] { state.clips[index].clipScale = scale }
+        }
+        if let error = save() {
+            state = previous
+            return error
+        }
+        return nil
     }
 
     func renameClip(id: String, to newName: String) {

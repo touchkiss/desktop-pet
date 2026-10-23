@@ -15,6 +15,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
 
     private let table = NSTableView()
     private let detail = DetailPanel()
+    private lazy var batchCalibration = ClipBatchCalibrationController(store: store)
     private let countLabel = NSTextField(labelWithString: "共 0 个片段")
     private let tabControl = NSSegmentedControl(
         labels: ["猫猫", "鼠标互动目标素材"],
@@ -29,6 +30,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
     private let scaleSlider = NSSlider()
     private let topToggle = NSButton(checkboxWithTitle: "置顶", target: nil, action: nil)
     private let clickToggle = NSButton(checkboxWithTitle: "点击穿透", target: nil, action: nil)
+    private let minimizeAfterLaunchToggle = NSButton(checkboxWithTitle: "启动后最小化窗口", target: nil, action: nil)
     private let launchAtLoginToggle = NSButton(checkboxWithTitle: "开机启动", target: nil, action: nil)
     private let preventIdleDisplaySleepToggle = NSButton(
         checkboxWithTitle: "阻止自动锁屏与关闭屏幕",
@@ -329,6 +331,21 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
             self.store.setClipScale(clipID: clipID, scale: scale)
             NotificationCenter.default.post(name: .petPresentationDidChange, object: nil)
         }
+        detail.onBatchCalibration = { [weak self] reference in
+            guard let self, let window = self.window else { return }
+            self.batchCalibration.preview(reference: reference, for: window)
+        }
+        detail.onUndoBatchCalibration = { [weak self] in
+            guard let self, let window = self.window else { return }
+            self.batchCalibration.undo(for: window)
+        }
+        batchCalibration.onStateChanged = { [weak self] busy, canUndo in
+            self?.detail.setBatchState(busy: busy, canUndo: canUndo)
+        }
+        batchCalibration.onChanged = { [weak self] in
+            NotificationCenter.default.post(name: .petPresentationDidChange, object: nil)
+            self?.reload(preservingSelection: true)
+        }
 
         body.addSubview(listPane)
         body.addSubview(divider)
@@ -392,6 +409,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         row1.addArrangedSubview(topToggle)
         row1.addArrangedSubview(clickToggle)
         row1.addArrangedSubview(launchAtLoginToggle)
+        minimizeAfterLaunchToggle.target = self
+        minimizeAfterLaunchToggle.action = #selector(minimizeAfterLaunchChanged)
+        minimizeAfterLaunchToggle.toolTip = "下次启动时不显示片段库，可从菜单栏重新打开。"
+        row1.addArrangedSubview(minimizeAfterLaunchToggle)
         row1.addArrangedSubview(NSView())
 
         let row2 = NSStackView()
@@ -554,6 +575,7 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         topToggle.state = store.state.alwaysOnTop ? .on : .off
         clickToggle.state = store.state.clickThrough ? .on : .off
         launchAtLoginToggle.state = LaunchAtLogin.isEnabled ? .on : .off
+        minimizeAfterLaunchToggle.state = UserDefaults.standard.bool(forKey: "minimizeWindowAfterLaunch") ? .on : .off
         refreshIdlePresentationControls()
         autoLinkToggle.state = store.state.autoLinkEnabled ? .on : .off
         scaleSlider.doubleValue = store.state.petScale
@@ -961,6 +983,10 @@ final class LibraryWindowController: NSWindowController, NSTableViewDataSource, 
         NotificationCenter.default.post(name: .libraryDidChange, object: nil)
     }
 
+    @objc private func minimizeAfterLaunchChanged() {
+        UserDefaults.standard.set(minimizeAfterLaunchToggle.state == .on, forKey: "minimizeWindowAfterLaunch")
+    }
+
     @objc private func launchAtLoginChanged() {
         let wantEnabled = launchAtLoginToggle.state == .on
         if let error = LaunchAtLogin.setEnabled(wantEnabled) {
@@ -1340,7 +1366,9 @@ final class ThumbnailCacheBox {
 // MARK: - Detail (fixed outer frame; content scrolls inside)
 
 @MainActor
-final class DetailPanel: NSView {
+final class DetailPanel: NSView, NSTextFieldDelegate {
+    var onBatchCalibration: ((PetClip) -> Void)?
+    var onUndoBatchCalibration: (() -> Void)?
     var onToggleNext: ((String, String, Bool) -> Void)?
     var onRename: ((String, String) -> Void)?
     var onToggleTag: ((String, String) -> Void)?
@@ -1354,6 +1382,8 @@ final class DetailPanel: NSView {
     private let documentView = FlippedClipView()
     private let preview = ClipPreviewPlayer()
     private let cursorPreyPreview = CursorPreyPreview()
+    private let calibration = ClipCalibrationView()
+    private lazy var calibrationWidthConstraint = calibration.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32)
     private var clipID: String?
     private var shownClipID: String?
     private var globalScale = 1.0
@@ -1363,6 +1393,8 @@ final class DetailPanel: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        calibration.onBatchCalibration = { [weak self] reference in self?.onBatchCalibration?(reference) }
+        calibration.onUndoBatchCalibration = { [weak self] in self?.onUndoBatchCalibration?() }
         wantsLayer = true
         layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
@@ -1414,6 +1446,7 @@ final class DetailPanel: NSView {
         self.globalScale = globalScale
 
         guard let clip else {
+            calibration.clearCurrent()
             let empty = NSTextField(wrappingLabelWithString: all.isEmpty
                 ? "还没有片段。点击左上角「添加视频…」导入绿幕猫猫。"
                 : "在左侧列表选择片段。可 ⌘/Shift 多选，全选后点「按所选播放」。当前共 \(all.count) 个片段。")
@@ -1430,6 +1463,7 @@ final class DetailPanel: NSView {
 
     func showMultiple(selected: [PetClip], queue: [String]) {
         clearStack()
+        calibration.clearCurrent()
         clipID = nil
         shownClipID = nil
 
@@ -1461,6 +1495,10 @@ final class DetailPanel: NSView {
     func stopPreviews() {
         preview.stop()
         cursorPreyPreview.stop()
+    }
+
+    func setBatchState(busy: Bool, canUndo: Bool) {
+        calibration.setBatchState(busy: busy, canUndo: canUndo)
     }
 
     private func clearStack() {
@@ -1536,9 +1574,13 @@ final class DetailPanel: NSView {
         stack.addArrangedSubview(cursorInteractionHint)
 
         if clip.tags.contains(ClipTag.cursorPrey) {
+            calibration.clearCurrent()
             appendCursorPreyEditor(clip: clip)
         } else {
             appendClipScaleEditor(clip: clip)
+            stack.addArrangedSubview(calibration)
+            calibrationWidthConstraint.isActive = true
+            calibration.configure(clip: clip, all: all, globalScale: globalScale)
         }
 
         // Ordinary clips retain the existing full-motion preview. Prey clips
@@ -1633,9 +1675,13 @@ final class DetailPanel: NSView {
     }
 
     private func appendClipScaleEditor(clip: PetClip) {
+        let editor = NSStackView()
+        editor.orientation = .vertical
+        editor.alignment = .leading
+        editor.spacing = 8
         let section = NSTextField(labelWithString: "猫猫片段大小")
         section.font = .boldSystemFont(ofSize: 13)
-        stack.addArrangedSubview(section)
+        editor.addArrangedSubview(section)
 
         let row = NSStackView()
         row.orientation = .horizontal
@@ -1649,10 +1695,17 @@ final class DetailPanel: NSView {
         slider.target = self
         slider.action = #selector(clipScaleChanged(_:))
         slider.identifier = NSUserInterfaceItemIdentifier(clip.id)
-        slider.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 160).isActive = true
 
-        let valueLabel = NSTextField(labelWithString: Self.clipScaleText(clip.clipScale))
+        let valueLabel = NSTextField(string: Self.clipScaleText(clip.clipScale))
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        valueLabel.widthAnchor.constraint(equalToConstant: 65).isActive = true
+        valueLabel.identifier = NSUserInterfaceItemIdentifier(clip.id)
+        valueLabel.delegate = self
+        valueLabel.target = self
+        valueLabel.action = #selector(clipScaleInputSubmitted(_:))
+        valueLabel.setAccessibilityLabel("猫猫片段倍率")
+        valueLabel.toolTip = "输入 0.25–3.00，回车或离开输入框保存"
 
         let resetButton = NSButton(title: "恢复默认", target: self, action: #selector(resetClipScale(_:)))
         resetButton.bezelStyle = .rounded
@@ -1660,8 +1713,9 @@ final class DetailPanel: NSView {
 
         row.addArrangedSubview(slider)
         row.addArrangedSubview(valueLabel)
+        row.addArrangedSubview(NSTextField(labelWithString: "×"))
         row.addArrangedSubview(resetButton)
-        stack.addArrangedSubview(row)
+        editor.addArrangedSubview(row)
 
         let effectiveLabel = NSTextField(labelWithString: PetClipPresentationPolicy.scaleSummary(
             clipScale: clip.clipScale,
@@ -1669,7 +1723,8 @@ final class DetailPanel: NSView {
         ))
         effectiveLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         effectiveLabel.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(effectiveLabel)
+        editor.addArrangedSubview(effectiveLabel)
+        calibration.setSizeEditor(editor)
 
         clipScaleSlider = slider
         clipScaleValueLabel = valueLabel
@@ -1677,7 +1732,7 @@ final class DetailPanel: NSView {
     }
 
     private static func clipScaleText(_ scale: Double) -> String {
-        String(format: "%.2f×", PetClipPresentationPolicy.clampedClipScale(scale))
+        String(format: "%.3f", PetClipPresentationPolicy.clampedClipScale(scale))
     }
 
     private static func preySizeText(_ displaySize: Double) -> String {
@@ -1748,6 +1803,25 @@ final class DetailPanel: NSView {
         onClipScaleChanged?(clipID, scale)
     }
 
+    @objc private func clipScaleInputSubmitted(_ sender: NSTextField) {
+        guard let clipID = sender.identifier?.rawValue else { return }
+        if let previous = clipScaleSlider?.doubleValue,
+           sender.stringValue == Self.clipScaleText(previous) { return }
+        guard let scale = ClipCalibrationGeometry.parsedClipScale(sender.stringValue) else {
+            NSSound.beep()
+            sender.stringValue = Self.clipScaleText(clipScaleSlider?.doubleValue ?? 1)
+            return
+        }
+        let previous = clipScaleSlider?.doubleValue
+        updateClipScaleEditor(scale)
+        if previous != scale { onClipScaleChanged?(clipID, scale) }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === clipScaleValueLabel else { return }
+        clipScaleInputSubmitted(field)
+    }
+
     @objc private func resetClipScale(_ sender: NSButton) {
         guard let clipID = sender.identifier?.rawValue else { return }
         let scale = PetClipPresentationPolicy.defaultClipScale
@@ -1757,6 +1831,7 @@ final class DetailPanel: NSView {
 
     private func updateClipScaleEditor(_ scale: Double) {
         let value = PetClipPresentationPolicy.clampedClipScale(scale)
+        calibration.setClipScale(value)
         clipScaleSlider?.doubleValue = value
         clipScaleValueLabel?.stringValue = Self.clipScaleText(value)
         clipEffectiveScaleLabel?.stringValue = PetClipPresentationPolicy.scaleSummary(
@@ -1802,6 +1877,7 @@ final class DetailPanel: NSView {
 private final class CursorPreyPreview: NSView {
     private let canvas = NSView()
     private let imageView = NSImageView()
+    private let video = AlphaVideoPlayback()
     private var imageWidthConstraint: NSLayoutConstraint!
     private var imageHeightConstraint: NSLayoutConstraint!
     private var timer: Timer?
@@ -1901,6 +1977,7 @@ private final class CursorPreyPreview: NSView {
     }
 
     func stop() {
+        video.pause()
         timer?.invalidate()
         timer = nil
     }
@@ -1920,13 +1997,18 @@ private final class CursorPreyPreview: NSView {
 
     private func showFrame(_ index: Int) {
         currentFrame = index
-        imageView.image = frameImage(at: index)
+        if let clipID, video.display(id: clipID, frame: index, frameCount: frameCount,
+                                    fps: fps, in: imageView, rect: imageView.bounds) {
+            imageView.image = nil
+        } else {
+            imageView.image = frameImage(at: index)
+        }
     }
 
     private func frameImage(at index: Int) -> NSImage? {
         guard let clipID else { return nil }
         if let image = cache[index] { return image }
-        guard let image = NSImage(contentsOf: AppPaths.frameURL(clipID: clipID, index: index)) else {
+        guard let image = ClipMedia.image(id: clipID, index: index, fps: fps) else {
             return nil
         }
         cache[index] = image
@@ -1946,6 +2028,7 @@ private final class CursorPreyPreview: NSView {
 @MainActor
 final class ClipPreviewPlayer: NSView {
     private let imageView = NSImageView()
+    private let video = AlphaVideoPlayback()
     private let playButton = NSButton()
     private let slider = NSSlider()
     private let frameLabel = NSTextField(labelWithString: "")
@@ -1953,6 +2036,7 @@ final class ClipPreviewPlayer: NSView {
     private var clipID: String?
     private var frameCount = 1
     private var fps: Double = 24
+    private var displayAspectRatio: CGFloat = 1
     private var currentFrame = 1
     private var isPlayingPreview = false
     private var cache: [Int: NSImage] = [:]
@@ -2050,6 +2134,7 @@ final class ClipPreviewPlayer: NSView {
         clipID = clip.id
         frameCount = max(1, clip.frameCount)
         fps = clip.fps > 0 ? clip.fps : 24
+        displayAspectRatio = CGFloat(max(1, clip.displayWidth)) / CGFloat(max(1, clip.displayHeight))
         cache.removeAll()
         cacheOrder.removeAll()
         slider.minValue = 1
@@ -2059,6 +2144,7 @@ final class ClipPreviewPlayer: NSView {
     }
 
     func stop() {
+        video.pause()
         timer?.invalidate()
         timer = nil
         isPlayingPreview = false
@@ -2088,7 +2174,12 @@ final class ClipPreviewPlayer: NSView {
 
     private func showFrame(_ index: Int) {
         currentFrame = index
-        imageView.image = frameImage(at: index)
+        if let clipID, video.display(id: clipID, frame: index, frameCount: frameCount,
+                                    fps: fps, playing: isPlayingPreview, in: imageView, rect: imageView.bounds, preserveAspect: true, aspectRatio: displayAspectRatio) {
+            imageView.image = nil
+        } else {
+            imageView.image = frameImage(at: index)
+        }
         slider.doubleValue = Double(index)
         frameLabel.stringValue = "\(index) / \(frameCount) 帧"
     }
@@ -2096,8 +2187,7 @@ final class ClipPreviewPlayer: NSView {
     private func frameImage(at index: Int) -> NSImage? {
         guard let clipID else { return nil }
         if let hit = cache[index] { return hit }
-        let url = AppPaths.frameURL(clipID: clipID, index: index)
-        guard let image = NSImage(contentsOf: url) else { return nil }
+        guard let image = ClipMedia.image(id: clipID, index: index, fps: fps) else { return nil }
         cache[index] = image
         cacheOrder.append(index)
         if cacheOrder.count > cacheLimit {
@@ -2169,13 +2259,12 @@ enum ClipExporter {
         }
 
         for index in indices {
-            let frameURL = AppPaths.frameURL(clipID: clip.id, index: index)
-            guard let image = NSImage(contentsOf: frameURL) else { continue }
+            guard let image = ClipMedia.image(id: clip.id, index: index, fps: clip.fps) else { continue }
             var proposedRect = CGRect(origin: .zero, size: image.size)
             guard let cg = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) else {
                 continue
             }
-            let scaled = downscale(cg, maxSide: 480)
+            let scaled = downscale(cg, displaySize: CGSize(width: clip.displayWidth, height: clip.displayHeight), maxSide: 480)
             let frameProperties: CFDictionary
             if apng {
                 frameProperties = [
@@ -2191,13 +2280,13 @@ enum ClipExporter {
         return CGImageDestinationFinalize(destination)
     }
 
-    private static func downscale(_ image: CGImage, maxSide: CGFloat) -> CGImage {
-        let width = CGFloat(image.width)
-        let height = CGFloat(image.height)
+    private static func downscale(_ image: CGImage, displaySize: CGSize, maxSide: CGFloat) -> CGImage {
+        let width = max(1, displaySize.width)
+        let height = max(1, displaySize.height)
         let scale = min(1, maxSide / max(width, height))
-        guard scale < 1 else { return image }
-        let newWidth = Int(width * scale)
-        let newHeight = Int(height * scale)
+        let newWidth = max(1, Int(width * scale))
+        let newHeight = max(1, Int(height * scale))
+        guard image.width != newWidth || image.height != newHeight else { return image }
         guard let context = CGContext(
             data: nil,
             width: newWidth,
