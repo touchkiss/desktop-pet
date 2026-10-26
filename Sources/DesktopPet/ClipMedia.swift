@@ -33,9 +33,17 @@ enum ClipMedia {
 
 /// One native video decoder per visible surface; no per-frame conversion to NSImage.
 @MainActor
-final class AlphaVideoPlayback {
+final class AlphaVideoPlayback: NSObject {
     let layer = AVPlayerLayer()
-    private let player = AVPlayer()
+    private var player: AVPlayer?
+    private let powerMonitor: PlaybackPowerMonitor
+    private let playerFactory: () -> AVPlayer
+    private let uptime: () -> TimeInterval
+    private let maximumPlayerAge: TimeInterval
+    private var playerCreatedAt: TimeInterval = 0
+    private var resumeTime: TimeInterval = 0
+    private var currentMovieURL: URL?
+    var isSuspended: Bool { powerMonitor.isSuspended }
     private let movieURLForID: (String) -> URL
     private var id: String?
     private var previousFrame = 0
@@ -49,20 +57,34 @@ final class AlphaVideoPlayback {
     private let imageContext = CIContext(options: [.cacheIntermediates: false])
 
     func playbackTime(for id: String) -> TimeInterval? {
-        guard self.id == id, player.currentItem?.status != .failed else { return nil }
+        guard self.id == id, player?.currentItem?.status != .failed else { return nil }
         if isSeeking { return seekTargetTime }
+        guard !isSuspended, let player else { return resumeTime }
         let seconds = player.currentTime().seconds
         return seconds.isFinite ? max(0, seconds) : 0
     }
 
-    init(movieURLForID: @escaping (String) -> URL = { ClipMedia.movieURL(id: $0) }) {
+    init(movieURLForID: @escaping (String) -> URL = { ClipMedia.movieURL(id: $0) },
+         powerMonitor: PlaybackPowerMonitor? = nil,
+         playerFactory: @escaping () -> AVPlayer = { AVPlayer() },
+         uptime: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         maximumPlayerAge: TimeInterval = 30 * 60) {
         self.movieURLForID = movieURLForID
-        player.isMuted = true
-        player.actionAtItemEnd = .pause
-        player.automaticallyWaitsToMinimizeStalling = false
-        layer.player = player
+        let powerMonitor = powerMonitor ?? .shared
+        self.powerMonitor = powerMonitor
+        self.playerFactory = playerFactory
+        self.uptime = uptime
+        self.maximumPlayerAge = maximumPlayerAge
+        super.init()
         layer.videoGravity = .resize
         layer.backgroundColor = NSColor.clear.cgColor
+        powerMonitor.changes.addObserver(self, selector: #selector(powerChanged),
+                                        name: PlaybackPowerMonitor.didChange, object: powerMonitor)
+    }
+
+    isolated deinit {
+        powerMonitor.changes.removeObserver(self)
+        releasePlayer()
     }
 
     var isActive: Bool { id != nil }
@@ -70,7 +92,10 @@ final class AlphaVideoPlayback {
     @discardableResult
     func display(id: String, frame: Int, frameCount: Int, fps: Double,
                  playing: Bool = true, in host: NSView, rect: CGRect, preserveAspect: Bool = false, aspectRatio: CGFloat? = nil) -> Bool {
-        guard FileManager.default.fileExists(atPath: movieURLForID(id).path), fps.isFinite, fps > 0 else {
+        let changed = self.id != id
+        let url = changed ? movieURLForID(id) : (currentMovieURL ?? movieURLForID(id))
+        guard (!changed && currentMovieURL != nil || FileManager.default.fileExists(atPath: url.path)),
+              fps.isFinite, fps > 0 else {
             stop()
             return false
         }
@@ -90,41 +115,30 @@ final class AlphaVideoPlayback {
         }
         CATransaction.commit()
         shouldPlay = playing && frame < frameCount
-        let changed = self.id != id
-        if changed {
-            generation += 1
-            isSeeking = false
-            self.id = id
-            self.fps = fps
-            let item = AVPlayerItem(url: movieURLForID(id))
-            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-            ])
-            item.add(output)
-            self.output = output
-            lastSnapshot = nil
-            player.replaceCurrentItem(with: item)
+        let wrapped = frame < previousFrame
+        let time = Double(max(0, frame - 1)) / fps
+        let needsSeek = changed || wrapped || (!playing && frame != previousFrame)
+            || (frame == frameCount && previousFrame != frameCount)
+        self.id = id
+        self.fps = fps
+        currentMovieURL = url
+        if isSuspended {
+            if needsSeek { resumeTime = time }
+            previousFrame = frame
+            return true
         }
+        let renew = player == nil || ((changed || wrapped) && uptime() - playerCreatedAt >= maximumPlayerAge)
+        if renew { releasePlayer() }
+        if changed || player == nil {
+            installItem(url: url)
+        }
+        guard let player else { return false }
         if player.currentItem?.status == .failed {
             stop()
             return false
         }
-        let time = CMTime(seconds: Double(max(0, frame - 1)) / fps, preferredTimescale: 1_000_000_000)
-        // Frame wrap, clip switch or explicit scrub/hold must seek. Ordinary ticks do not.
-        if changed || frame < previousFrame || (!playing && frame != previousFrame)
-            || (frame == frameCount && previousFrame != frameCount) {
-            generation += 1
-            let revision = generation
-            isSeeking = true
-            seekTargetTime = time.seconds
-            player.pause()
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                Task { @MainActor in
-                    guard let self, revision == self.generation else { return }
-                    self.isSeeking = false
-                    if finished && self.shouldPlay { self.player.play() }
-                }
-            }
+        if needsSeek || renew {
+            seek(to: time)
         } else if !shouldPlay {
             player.pause()
         } else if !isSeeking && player.rate == 0 {
@@ -134,8 +148,82 @@ final class AlphaVideoPlayback {
         return true
     }
 
+    private func removeOutput() {
+        if let output { player?.currentItem?.remove(output) }
+        output = nil
+        lastSnapshot = nil
+    }
+
+    private func installItem(url: URL) {
+        generation += 1
+        isSeeking = false
+        removeOutput()
+        player?.currentItem?.cancelPendingSeeks()
+        if player == nil {
+            let player = playerFactory()
+            player.isMuted = true
+            player.actionAtItemEnd = .pause
+            player.automaticallyWaitsToMinimizeStalling = false
+            self.player = player
+            playerCreatedAt = uptime()
+            layer.player = player
+        }
+        player?.replaceCurrentItem(with: AVPlayerItem(url: url))
+    }
+
+    private func seek(to seconds: TimeInterval) {
+        guard let player else { return }
+        generation += 1
+        let revision = generation
+        removeOutput()
+        player.currentItem?.cancelPendingSeeks()
+        isSeeking = true
+        seekTargetTime = seconds
+        resumeTime = seconds
+        player.pause()
+        let time = CMTime(seconds: seconds, preferredTimescale: 1_000_000_000)
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, revision == self.generation, !self.isSuspended else { return }
+                self.isSeeking = false
+                if finished && self.shouldPlay { self.player?.play() }
+            }
+        }
+    }
+
+    private func releasePlayer() {
+        generation += 1
+        isSeeking = false
+        player?.pause()
+        player?.currentItem?.cancelPendingSeeks()
+        removeOutput()
+        layer.player = nil
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+    }
+
+    @objc private func powerChanged() {
+        if isSuspended {
+            if isSeeking { resumeTime = seekTargetTime }
+            else if let seconds = player?.currentTime().seconds, seconds.isFinite {
+                resumeTime = max(0, seconds)
+            }
+            releasePlayer()
+        } else if id != nil, let url = currentMovieURL {
+            installItem(url: url)
+            seek(to: resumeTime)
+        }
+    }
+
     func snapshot() -> NSImage? {
-        guard let id else { return nil }
+        guard let id, !isSuspended, let player else { return nil }
+        if output == nil, let item = player.currentItem {
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ])
+            item.add(output)
+            self.output = output
+        }
         if let buffer = output?.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil) {
             let image = CIImage(cvPixelBuffer: buffer)
             if let cg = imageContext.createCGImage(image, from: image.extent) {
@@ -150,19 +238,16 @@ final class AlphaVideoPlayback {
 
     func pause() {
         shouldPlay = false
-        player.pause()
+        player?.pause()
     }
 
     func stop() {
-        generation += 1
         shouldPlay = false
-        isSeeking = false
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        output = nil
-        lastSnapshot = nil
+        releasePlayer()
         layer.removeFromSuperlayer()
         id = nil
+        currentMovieURL = nil
         previousFrame = 0
+        resumeTime = 0
     }
 }

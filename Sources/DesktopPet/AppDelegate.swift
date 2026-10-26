@@ -37,6 +37,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRecoveringDisplaySleepSetting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let powerMonitor = PlaybackPowerMonitor.shared
+        engine.playbackIsSuspended = { powerMonitor.isSuspended }
         engine.attach(store: store)
 
         let pet = PetWindowController(store: store, engine: engine)

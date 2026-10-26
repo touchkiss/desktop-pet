@@ -193,6 +193,10 @@ final class CursorPreyOverlayController: NSObject, NSWindowDelegate {
 
     private func driverTick(for revision: UInt) {
         guard isActive, revision == sessionRevision else { return }
+        if video.isSuspended {
+            lastDriverTickTime = ProcessInfo.processInfo.systemUptime
+            return
+        }
         guard driverTimer?.isValid == true,
               let window,
               window.isVisible,

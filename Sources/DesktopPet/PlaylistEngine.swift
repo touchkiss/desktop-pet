@@ -17,6 +17,7 @@ final class PlaylistEngine {
     var onFrameChanged: (() -> Void)?
     /// Native video clock when available; legacy sequences retain timer-based advancement.
     var playbackTimeProvider: ((String) -> TimeInterval?)?
+    var playbackIsSuspended: (() -> Bool)?
 
     private weak var store: LibraryStore?
     private var timer: Timer?
@@ -235,7 +236,7 @@ final class PlaylistEngine {
         ) else {
             return
         }
-        if holdingAtEnd { return }
+        if playbackIsSuspended?() == true || holdingAtEnd { return }
 
         guard let store,
               let id = currentClipID,

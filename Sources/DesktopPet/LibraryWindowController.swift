@@ -1493,8 +1493,8 @@ final class DetailPanel: NSView, NSTextFieldDelegate {
     }
 
     func stopPreviews() {
-        preview.stop()
-        cursorPreyPreview.stop()
+        preview.stop(releasingVideo: true)
+        cursorPreyPreview.stop(releasingVideo: true)
     }
 
     func setBatchState(busy: Bool, canUndo: Bool) {
@@ -1944,7 +1944,7 @@ private final class CursorPreyPreview: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { stop() }
+        if window == nil { stop(releasingVideo: true) }
     }
 
     func load(clip: PetClip, displaySize: Double) {
@@ -1976,8 +1976,8 @@ private final class CursorPreyPreview: NSView {
         layoutSubtreeIfNeeded()
     }
 
-    func stop() {
-        video.pause()
+    func stop(releasingVideo: Bool = false) {
+        if releasingVideo { video.stop() } else { video.pause() }
         timer?.invalidate()
         timer = nil
     }
@@ -1992,6 +1992,7 @@ private final class CursorPreyPreview: NSView {
     }
 
     private func tick() {
+        guard !video.isSuspended else { return }
         showFrame(currentFrame % frameCount + 1)
     }
 
@@ -2126,7 +2127,7 @@ final class ClipPreviewPlayer: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // Leaving the window (detail cleared, library closed) stops playback.
-        if window == nil { stop() }
+        if window == nil { stop(releasingVideo: true) }
     }
 
     func load(clip: PetClip) {
@@ -2143,8 +2144,8 @@ final class ClipPreviewPlayer: NSView {
         startPlaying()
     }
 
-    func stop() {
-        video.pause()
+    func stop(releasingVideo: Bool = false) {
+        if releasingVideo { video.stop() } else { video.pause() }
         timer?.invalidate()
         timer = nil
         isPlayingPreview = false
@@ -2169,6 +2170,7 @@ final class ClipPreviewPlayer: NSView {
     }
 
     private func tick() {
+        guard !video.isSuspended else { return }
         showFrame(currentFrame % frameCount + 1)
     }
 
